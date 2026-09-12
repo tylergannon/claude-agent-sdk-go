@@ -188,6 +188,121 @@ func TestMockTransportReadMessagesRoundTrip(t *testing.T) {
 	assert.IsType(t, &ErrTransportClosed{}, err)
 }
 
+func TestSubprocessTransportRawMessageObserverPreservesTypedStream(t *testing.T) {
+	runner := NewMockSubprocessRunner()
+	var observed json.RawMessage
+	options := &Options{}
+	WithIncludePartialMessages(true)(options)
+	WithRawMessageObserver(func(raw json.RawMessage) error {
+		observed = raw
+		// The observer owns this copy. Mutating it must not affect the bytes
+		// subsequently passed to ParseMessage.
+		raw[0] = ' '
+		return nil
+	})(options)
+	transport := NewSubprocessTransportWithRunner(runner, options)
+	require.NoError(t, transport.Connect(context.Background()))
+	assert.Contains(t, runner.StartArgs, "--include-partial-messages")
+
+	line := []byte(`{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hello"}]},"session_id":"sess_123","parent_tool_use_id":null}`)
+	_, err := runner.StdoutPipe.Write(append(line, '\n'))
+	require.NoError(t, err)
+	require.NoError(t, runner.StdoutPipe.Close())
+
+	var messages []Message
+	for msg, readErr := range transport.ReadMessages(context.Background()) {
+		require.NoError(t, readErr)
+		messages = append(messages, msg)
+	}
+
+	require.Len(t, messages, 1)
+	user, ok := messages[0].(UserMessage)
+	require.True(t, ok)
+	assert.Equal(t, "sess_123", user.SessionID)
+	require.Len(t, observed, len(line))
+	assert.Equal(t, byte(' '), observed[0], "observer received writable owned bytes")
+	assert.Equal(t, byte('{'), line[0], "observer did not alias the source line")
+}
+
+func TestSubprocessTransportRawMessageObserverCanRetainBytes(t *testing.T) {
+	runner := NewMockSubprocessRunner()
+	var observed []json.RawMessage
+	options := &Options{
+		RawMessageObserver: func(raw json.RawMessage) error {
+			observed = append(observed, raw)
+			return nil
+		},
+	}
+	transport := NewSubprocessTransportWithRunner(runner, options)
+	require.NoError(t, transport.Connect(context.Background()))
+
+	first := `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"first"}]},"session_id":"one","parent_tool_use_id":null}`
+	second := `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"second"}]},"session_id":"two","parent_tool_use_id":null}`
+	_, err := runner.StdoutPipe.Write([]byte(first + "\n" + second + "\n"))
+	require.NoError(t, err)
+	require.NoError(t, runner.StdoutPipe.Close())
+
+	for _, readErr := range transport.ReadMessages(context.Background()) {
+		require.NoError(t, readErr)
+	}
+
+	require.Len(t, observed, 2)
+	assert.JSONEq(t, first, string(observed[0]))
+	assert.JSONEq(t, second, string(observed[1]))
+}
+
+func TestSubprocessTransportRawMessageObserverErrorStopsStream(t *testing.T) {
+	runner := NewMockSubprocessRunner()
+	wantErr := errors.New("stop observation")
+	var calls int
+	options := &Options{
+		RawMessageObserver: func(json.RawMessage) error {
+			calls++
+			return wantErr
+		},
+	}
+	transport := NewSubprocessTransportWithRunner(runner, options)
+	require.NoError(t, transport.Connect(context.Background()))
+
+	line := `{"type":"user","message":{"role":"user","content":[]},"session_id":"one","parent_tool_use_id":null}`
+	_, err := runner.StdoutPipe.Write([]byte(line + "\n" + line + "\n"))
+	require.NoError(t, err)
+	require.NoError(t, runner.StdoutPipe.Close())
+
+	var got []error
+	for msg, readErr := range transport.ReadMessages(context.Background()) {
+		assert.Nil(t, msg)
+		got = append(got, readErr)
+	}
+
+	require.Len(t, got, 1)
+	assert.ErrorIs(t, got[0], wantErr)
+	assert.Equal(t, 1, calls, "observer error terminates before later lines")
+}
+
+func TestSubprocessTransportRawMessageObserverNotCalledAfterClose(t *testing.T) {
+	runner := NewMockSubprocessRunner()
+	var calls atomic.Int32
+	options := &Options{
+		RawMessageObserver: func(json.RawMessage) error {
+			calls.Add(1)
+			return nil
+		},
+	}
+	transport := NewSubprocessTransportWithRunner(runner, options)
+	require.NoError(t, transport.Connect(context.Background()))
+
+	line := `{"type":"user","message":{"role":"user","content":[]},"session_id":"one","parent_tool_use_id":null}`
+	_, err := runner.StdoutPipe.Write([]byte(line + "\n"))
+	require.NoError(t, err)
+	require.NoError(t, transport.Close())
+
+	for _, readErr := range transport.ReadMessages(context.Background()) {
+		require.NoError(t, readErr)
+	}
+	assert.Equal(t, int32(0), calls.Load())
+}
+
 // TestWithTransportOptionPlumbed verifies that WithTransport stores the
 // injected transport on Options so Client.Connect's injection branch picks it
 // up. End-to-end coverage through Client.Connect is deferred until the

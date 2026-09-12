@@ -91,6 +91,10 @@ type SubprocessTransport struct {
 	errLogger atomic.Pointer[writerRef]
 	exitOnce  sync.Once
 	exitErr   error
+
+	// rawObserverMu prevents an observer from starting after Close and makes
+	// Close wait for an in-flight synchronous observer to return.
+	rawObserverMu sync.Mutex
 }
 
 // awaitExit blocks on the subprocess exit exactly once and caches the result,
@@ -497,6 +501,10 @@ func (t *SubprocessTransport) ReadMessages(ctx context.Context) iter.Seq2[Messag
 		// stdout, so we MUST use the same scanner instance - creating a new one
 		// would miss any data already buffered by the original scanner.
 		for {
+			if t.closed.Load() {
+				return
+			}
+
 			// Check context cancellation.
 			select {
 			case <-ctx.Done():
@@ -516,6 +524,24 @@ func (t *SubprocessTransport) ReadMessages(ctx context.Context) iter.Seq2[Messag
 			line := t.scanner.Bytes()
 			if len(line) == 0 {
 				continue // Skip empty lines.
+			}
+
+			if observer := t.options.RawMessageObserver; observer != nil {
+				// Scanner.Bytes aliases storage reused by the next Scan. Give the
+				// observer an owned copy and parse the original so observer mutation
+				// cannot change existing typed behavior.
+				raw := append(json.RawMessage(nil), line...)
+				t.rawObserverMu.Lock()
+				if t.closed.Load() {
+					t.rawObserverMu.Unlock()
+					return
+				}
+				err := observer(raw)
+				t.rawObserverMu.Unlock()
+				if err != nil {
+					yield(nil, fmt.Errorf("raw message observer: %w", err))
+					return
+				}
 			}
 
 			// Parse message.
@@ -571,6 +597,11 @@ func (t *SubprocessTransport) Close() error {
 	if !t.closed.CompareAndSwap(false, true) {
 		return nil // Already closed
 	}
+
+	// Wait for an observer already in progress. The closed flag prevents a
+	// reader that was blocked in Scan from starting another observer.
+	t.rawObserverMu.Lock()
+	t.rawObserverMu.Unlock()
 
 	// Close stdin to signal termination
 	if t.stdin != nil {

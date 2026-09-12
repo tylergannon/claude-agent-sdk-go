@@ -233,6 +233,14 @@ type Options struct {
 	// IncludePartialMessages includes partial message events in stream.
 	IncludePartialMessages bool
 
+	// RawMessageObserver receives a copy of each non-empty stdout JSON message
+	// synchronously before the SDK parses it into a Message. Returning an error
+	// stops the stream and yields that error from ReadMessages.
+	//
+	// The callback owns the supplied bytes and may retain or modify them. It
+	// must not call transport lifecycle methods such as Close.
+	RawMessageObserver func(json.RawMessage) error
+
 	// Continue continues the most recent conversation.
 	Continue bool
 
@@ -2785,6 +2793,15 @@ func WithEnableFileCheckpointing(enable bool) Option {
 func WithIncludePartialMessages(include bool) Option {
 	return func(o *Options) {
 		o.IncludePartialMessages = include
+	}
+}
+
+// WithRawMessageObserver observes lossless CLI stdout messages before typed
+// parsing. The observer runs synchronously with stream consumption and owns the
+// supplied byte copy. Returning an error stops the stream.
+func WithRawMessageObserver(observer func(json.RawMessage) error) Option {
+	return func(o *Options) {
+		o.RawMessageObserver = observer
 	}
 }
 
