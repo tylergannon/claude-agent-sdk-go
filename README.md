@@ -46,7 +46,7 @@ sequenceDiagram
 ## Installation
 
 ```bash
-go get github.com/roasbeef/claude-agent-sdk-go
+go get github.com/tylergannon/claude-agent-sdk-go
 ```
 
 Requirements:
@@ -64,7 +64,7 @@ import (
     "fmt"
     "log"
 
-    "github.com/roasbeef/claude-agent-sdk-go"
+    "github.com/tylergannon/claude-agent-sdk-go"
 )
 
 func main() {

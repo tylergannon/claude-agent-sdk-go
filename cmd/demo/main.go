@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	claudeagent "github.com/roasbeef/claude-agent-sdk-go"
+	claudeagent "github.com/tylergannon/claude-agent-sdk-go"
 )
 
 func main() {

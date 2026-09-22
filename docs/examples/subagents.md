@@ -196,7 +196,7 @@ import (
     "sync"
     "time"
 
-    "github.com/roasbeef/claude-agent-sdk-go"
+    "github.com/tylergannon/claude-agent-sdk-go"
 )
 
 // SubagentTracker monitors subagent activity.
