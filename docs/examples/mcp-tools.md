@@ -28,7 +28,7 @@ import (
     "fmt"
     "log"
 
-    "github.com/roasbeef/claude-agent-sdk-go"
+    "github.com/tylergannon/claude-agent-sdk-go"
 )
 
 // Define argument types as structs with JSON tags.
@@ -325,7 +325,7 @@ import (
     "log"
     "time"
 
-    "github.com/roasbeef/claude-agent-sdk-go"
+    "github.com/tylergannon/claude-agent-sdk-go"
 )
 
 type TimezoneArgs struct {

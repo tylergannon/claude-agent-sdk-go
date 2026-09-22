@@ -1,4 +1,4 @@
-module github.com/roasbeef/claude-agent-sdk-go
+module github.com/tylergannon/claude-agent-sdk-go
 
 go 1.24.0
 
