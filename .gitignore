@@ -4,3 +4,6 @@ package/*
 
 # Vendored TS SDK trees pulled for parity diffing during catchup cycles.
 scratch/
+
+# Go build cache; never commit it.
+.cache/
