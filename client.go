@@ -144,6 +144,7 @@ func (c *Client) Connect(ctx context.Context) error {
 // messagePump reads from transport and routes messages.
 func (c *Client) messagePump() {
 	defer close(c.msgCh)
+	defer c.protocol.endOutput()
 	for msg, err := range c.transport.ReadMessages(c.msgCtx) {
 		if err != nil {
 			continue
@@ -1578,16 +1579,14 @@ func (s *Stream) dispatchControlRequest(
 		return nil, fmt.Errorf("control request %q: write: %w", subtype, err)
 	}
 
-	select {
-	case <-ctx.Done():
-		p.pendingReqs.Delete(requestID)
-		return nil, ctx.Err()
-	case resp := <-ch:
-		if resp.Response.Subtype == "error" {
-			return nil, fmt.Errorf("control request %q: %s", subtype, resp.Response.Error)
-		}
-		return &resp, nil
+	resp, err := p.waitForSDKResponse(ctx, requestID, ch)
+	if err != nil {
+		return nil, err
 	}
+	if resp.Response.Subtype == "error" {
+		return nil, fmt.Errorf("control request %q: %s", subtype, resp.Response.Error)
+	}
+	return &resp, nil
 }
 
 // InitializationResult returns the cached initialize response.

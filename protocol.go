@@ -3,6 +3,7 @@ package claudeagent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,11 @@ type Protocol struct {
 	sdkMcpServers map[string]*McpServer   // serverName -> server (in-process MCP)
 	initResponse  atomic.Pointer[SDKControlInitializeResponse]
 	initialized   atomic.Bool
+
+	// outputEnded closes once the CLI's output ends, so requests still
+	// waiting for a reply fail instead of waiting out their context.
+	outputEnded     chan struct{}
+	outputEndedOnce sync.Once
 }
 
 // NewProtocol creates a new protocol handler.
@@ -40,7 +46,14 @@ func NewProtocol(transport Transport, options *Options) *Protocol {
 		options:       options,
 		hookCallbacks: make(map[string]HookCallback),
 		sdkMcpServers: sdkMcpServers,
+		outputEnded:   make(chan struct{}),
 	}
+}
+
+// endOutput records that the CLI's output has ended: no reply to a pending
+// control request can arrive any more. Idempotent.
+func (p *Protocol) endOutput() {
+	p.outputEndedOnce.Do(func() { close(p.outputEnded) })
 }
 
 // Initialize sends the initialization control message to the CLI.
@@ -1582,6 +1595,17 @@ func (p *Protocol) waitForSDKResponse(
 		return SDKControlResponse{}, ctx.Err()
 	case resp := <-ch:
 		return resp, nil
+	case <-p.outputEnded:
+		// A reply routed just before the output ended still counts.
+		select {
+		case resp := <-ch:
+			return resp, nil
+		default:
+		}
+		p.pendingReqs.Delete(requestID)
+		return SDKControlResponse{}, &ErrSubprocessFailed{
+			Cause: errors.New("claude CLI output ended before it replied"),
+		}
 	}
 }
 
