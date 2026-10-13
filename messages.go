@@ -19,21 +19,85 @@ type Message interface {
 // This message type initiates or continues a conversation. The ParentToolUseID
 // field links this message to a specific tool call when providing tool results.
 type UserMessage struct {
-	Type            string               `json:"type"`                       // Always "user"
-	UUID            string               `json:"uuid,omitempty"`             // Unique message ID
-	SessionID       string               `json:"session_id"`                 // Session identifier
-	Message         APIUserMessage       `json:"message"`                    // Message content
-	ParentToolUseID *string              `json:"parent_tool_use_id"`         // For tool results (null if not tool result)
-	IsSynthetic     bool                 `json:"isSynthetic,omitempty"`      // True for system-generated messages
-	ToolUseResult   interface{}          `json:"tool_use_result,omitempty"`  // Tool result JSON if applicable
-	Priority        *UserMessagePriority `json:"priority,omitempty"`         // Scheduling priority
-	SubagentType    string               `json:"subagent_type,omitempty"`    // Subagent type that produced this message
-	TaskDescription string               `json:"task_description,omitempty"` // Description of the subagent task that produced this message
+	Type            string               `json:"type"`                      // Always "user"
+	UUID            string               `json:"uuid,omitempty"`            // Unique message ID
+	SessionID       string               `json:"session_id"`                // Session identifier
+	Message         APIUserMessage       `json:"message"`                   // Message content
+	ParentToolUseID *string              `json:"parent_tool_use_id"`        // For tool results (null if not tool result)
+	IsSynthetic     bool                 `json:"isSynthetic,omitempty"`     // True for system-generated messages
+	ToolUseResult   interface{}          `json:"tool_use_result,omitempty"` // Tool result JSON if applicable
+	Priority        *UserMessagePriority `json:"priority,omitempty"`        // Scheduling priority
+	// AgentID is the id of the subagent that produced this message: the
+	// task_id of its task events, unchanged when the subagent is resumed.
+	// Empty on main-thread messages (sdk.d.ts v0.3.296 L6393).
+	AgentID         string `json:"agent_id,omitempty"`
+	SubagentType    string `json:"subagent_type,omitempty"`    // Subagent type that produced this message
+	TaskDescription string `json:"task_description,omitempty"` // Description of the subagent task that produced this message
 	// SenderTaskID is the task id of the in-process background subagent that
 	// sent this message, stamped by the harness from the sending loop (never
 	// from tool input). Absent for cross-session peers. Note: camelCase wire
 	// key, matching the TS SDK.
 	SenderTaskID string `json:"senderTaskId,omitempty"`
+	// PastedContent is content the user pasted into the prompt rather than
+	// typed: each entry a string or an array of content blocks. The CLI
+	// appends the text of each entry after the typed text, in order, and may
+	// wrap it in <pasted_content> tags. Blocks other than text are ignored;
+	// send images and documents in Message.Content instead. A list of over
+	// 1,000 entries and blocks in all is ignored (sdk.d.ts v0.3.296 L6383).
+	PastedContent []PastedContentEntry `json:"pasted_content,omitempty"`
+	// InlinePastes is text the user pasted that still sits in
+	// Message.Content where they put it, one entry per paste. The host leaves
+	// the prompt as is; the CLI may wrap each entry in <pasted_content> tags
+	// where it still stands in the last text block, looking at the first 100
+	// non-blank entries only. A paste the host took out of the message
+	// belongs in PastedContent instead (sdk.d.ts v0.3.296 L6388).
+	InlinePastes []string `json:"inline_pastes,omitempty"`
+	// ClientComposed marks a turn the client assembled from content the user
+	// did not type: the CLI delivers its text as written, with no @path
+	// expansion and no slash-command dispatch. Current CLIs also skip the
+	// whole turn-start attachment pass (nested CLAUDE.md, skill and tool
+	// listings, reminders), so that context arrives after the first tool call
+	// instead. Options.VerbatimPrompts sets it on every message (sdk.d.ts
+	// v0.3.290 L6284).
+	ClientComposed bool `json:"client_composed,omitempty"`
+}
+
+// PastedContentEntry is one entry of UserMessage.PastedContent, the union
+// MessageParam['content'] the TS SDK carries per entry: either a plain string
+// or an array of content blocks. Exactly one of Text / Blocks is meaningful;
+// Blocks takes precedence when both are set.
+type PastedContentEntry struct {
+	// Text is the entry as a plain pasted string.
+	Text string
+	// Blocks is the entry as an array of content blocks. Only text blocks are
+	// honored by the CLI.
+	Blocks []UserContentBlock
+}
+
+// MarshalJSON emits the entry as the TS union: a bare string, or an array of
+// content blocks when Blocks is set.
+func (e PastedContentEntry) MarshalJSON() ([]byte, error) {
+	if e.Blocks != nil {
+		return json.Marshal(e.Blocks)
+	}
+	return json.Marshal(e.Text)
+}
+
+// UnmarshalJSON accepts either wire form of the union.
+func (e *PastedContentEntry) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		e.Text = s
+		e.Blocks = nil
+		return nil
+	}
+	var blocks []UserContentBlock
+	if err := json.Unmarshal(data, &blocks); err != nil {
+		return err
+	}
+	e.Text = ""
+	e.Blocks = blocks
+	return nil
 }
 
 // APIUserMessage represents the message content in Anthropic API format.
@@ -105,19 +169,35 @@ type AssistantMessage struct {
 	// PartialAssistantMessage.UserMessageUUID), though a turn that produces
 	// no stream events still stamps its first assistant message. Every later
 	// frame of the turn leaves it empty, as do subagent frames
-	// (ParentToolUseID set), synthetic and scheduled turns, turns the caller
-	// sent no uuid for, and older producers (sdk.d.ts v0.3.251 L3211).
+	// (ParentToolUseID set), turns the caller sent no uuid for, and older
+	// producers.
+	//
+	// A synthetic or scheduled (meta) turn normally leaves it empty, but as of
+	// v0.3.270 it re-stamps: each user message folded into the turn mid-run
+	// takes the echo over, and the first reply frame of each kind after that
+	// fold carries the folded message's uuid. A meta turn's own uuid is stamped
+	// only when the host vouches it is the client event's own (sdk.d.ts
+	// v0.3.270 L3352).
 	UserMessageUUID string `json:"user_message_uuid,omitempty"`
 	// UserMessageUUIDs lists the client uuids of every user message whose
 	// prompt this turn has consumed so far, in consumption order. When the
 	// host merges a batch of sends made close together into one turn, that
 	// turn's UserMessageUUID names only the LAST member; this list names them
 	// all, so any sender in the batch can bind the reply by finding its own
-	// uuid anywhere in it. Always contains UserMessageUUID and holds at most
-	// 64 entries. Present exactly when UserMessageUUID is, on the same first
-	// reply frame; absent from older producers, where you fall back to the
-	// singular field (sdk.d.ts v0.3.263 L3336).
+	// uuid anywhere in it. It also picks up any user message folded into the
+	// turn before this frame (the meta-turn case above). Always contains
+	// UserMessageUUID and holds at most 64 entries. Present exactly when
+	// UserMessageUUID is; absent from older producers, where you fall back to
+	// the singular field (sdk.d.ts v0.3.270 L3356).
 	UserMessageUUIDs []string `json:"user_message_uuids,omitempty"`
+
+	// ResumeReason says why this frame's turn is the automatic re-run of a
+	// turn a worker restart interrupted. It rides the same frames as
+	// UserMessageUUID, which on such a re-run names the interrupted turn's own
+	// last user prompt — so a consumer can tell the re-run's first reply from
+	// the interrupted attempt's. Empty on every other turn and from older
+	// producers. See the ResumeReason* constants (sdk.d.ts v0.3.270 L3362).
+	ResumeReason string `json:"resume_reason,omitempty"`
 
 	// Supersedes lists wire UUIDs of previously-delivered messages that this
 	// message replaces (refusal-fallback supersede). The list can include
@@ -143,6 +223,12 @@ type AssistantMessage struct {
 	// received and the content may end mid-word. Absent on normally completed
 	// messages (sdk.d.ts v0.3.215).
 	Aborted bool `json:"aborted,omitempty"`
+
+	// AgentID is the id of the subagent that produced this message: the
+	// task_id of its task events, unchanged when the subagent is resumed, so
+	// it joins this message to TaskStartedMessage.TaskID. Empty for
+	// top-level assistant turns (sdk.d.ts v0.3.296 L3669).
+	AgentID string `json:"agent_id,omitempty"`
 
 	// SubagentType is the subagent type that produced this message, when
 	// the message originated from a subagent task. Empty for top-level
@@ -173,6 +259,120 @@ type AssistantMessage struct {
 	// — never inside message.content — so it is not replayed to the model
 	// (sdk.d.ts v0.3.233 L3058).
 	ContextUsage *AssistantContextUsage `json:"context_usage,omitempty"`
+
+	// UsageReport is the structured twin of the /usage report, carried on the
+	// synthetic assistant message that delivers its text. Set only on /usage
+	// results from CLIs new enough to attach it and from claude.ai-subscriber
+	// sessions; the text in Message.Content stays the canonical fallback. A
+	// wrapper-level sibling — never inside message.content — so it is not
+	// replayed to the model.
+	//
+	// Experimental: the TS SDK marks the shape as subject to change
+	// (sdk.d.ts v0.3.278 L3463).
+	UsageReport *UsageReport `json:"usage_report,omitempty"`
+}
+
+// UsageReport is the structured twin of a /usage result, carried beside its
+// text for clients that render a card from data rather than parsing prose.
+//
+// It carries the session totals, the plan's usage rows as the server sent
+// them, and the extra-usage spend. Nothing else from the usage body: the
+// get_usage control reply carries the rest.
+//
+// Experimental — the TS SDK says the shape may change (sdk.d.ts v0.3.278
+// L5807).
+type UsageReport struct {
+	// Session is cost and usage accumulated by the current session.
+	Session UsageReportSession `json:"session"`
+	// RateLimits is the plan's usage rows and extra-usage spend from the
+	// claude.ai usage endpoint. Nil when the CLI could not fetch them: no
+	// plan on this lane, or a token without the profile scope.
+	RateLimits *UsageReportRateLimits `json:"rate_limits"`
+}
+
+// UsageReportSession is the current session's accumulated cost and usage.
+type UsageReportSession struct {
+	TotalCostUSD       float64               `json:"total_cost_usd"`
+	TotalAPIDurationMs int64                 `json:"total_api_duration_ms"`
+	TotalDurationMs    int64                 `json:"total_duration_ms"`
+	TotalLinesAdded    int                   `json:"total_lines_added"`
+	TotalLinesRemoved  int                   `json:"total_lines_removed"`
+	ModelUsage         map[string]ModelUsage `json:"model_usage"`
+}
+
+// UsageReportRateLimits is the plan's usage rows and extra-usage spend.
+type UsageReportRateLimits struct {
+	// Limits is the server's usage rows, as sent. Which meters apply, their
+	// scope, labels, severity and order are all the server's, so a client
+	// renders them verbatim and a new meter needs no client release.
+	//
+	// The empty and nil cases differ: empty means the server reported no
+	// meters, nil means the body carried no rows at all (a server that
+	// predates them, or a usage fetch that is currently failing). Only ever
+	// the server's current reply — neither the row the CLI builds from
+	// rate-limit response headers for its own screen nor its snapshot of an
+	// earlier reply appears here.
+	Limits []UsageReportLimit `json:"limits"`
+	// ExtraUsage is overage spend for the billing period, when the plan has
+	// it. Nil when it does not.
+	ExtraUsage *UsageReportExtraUsage `json:"extra_usage,omitempty"`
+}
+
+// UsageReportLimit is one server-authored usage row.
+//
+// Kind, Group and Severity are the server's strings rather than Go enums on
+// purpose: the server owns the meter taxonomy, and a new meter has to render
+// without an SDK release. Classify a row on Kind, never on a label.
+type UsageReportLimit struct {
+	// Kind is the server's meter kind, e.g. "session", "weekly_all" or
+	// "weekly_scoped".
+	Kind string `json:"kind"`
+	// Group is the server's row group, e.g. "session" or "weekly". Rows
+	// render grouped under it, in the server's order.
+	Group string `json:"group"`
+	// Percent is the share of the window used, 0-100.
+	Percent float64 `json:"percent"`
+	// ResetsAt is when the window resets, ISO 8601. Nil when the server sent
+	// no reset time.
+	ResetsAt *string `json:"resets_at"`
+	// Scope is what a scoped row is for, a model or a surface, with the
+	// server's display label. Nil on unscoped rows.
+	Scope *UsageReportLimitScope `json:"scope,omitempty"`
+	// Severity is the server's reading of the row, e.g. "normal", "warning"
+	// or "critical". Every row here is the server's, so a client never grades
+	// a row itself.
+	Severity string `json:"severity"`
+	// IsActive marks the server's headline pick: the row a single-value
+	// indicator shows.
+	IsActive bool `json:"is_active"`
+}
+
+// UsageReportLimitScope names what a scoped usage row covers.
+type UsageReportLimitScope struct {
+	Model   *UsageReportScopeLabel `json:"model,omitempty"`
+	Surface *UsageReportScopeLabel `json:"surface,omitempty"`
+}
+
+// UsageReportScopeLabel is a server-authored display label.
+type UsageReportScopeLabel struct {
+	DisplayName string `json:"display_name"`
+}
+
+// UsageReportExtraUsage is overage spend for the billing period.
+//
+// Amounts are in minor units of Currency (cents for USD), so rendering them
+// as a major-unit figure without dividing is off by a hundred.
+type UsageReportExtraUsage struct {
+	// IsEnabled is false while extra usage cannot cover sends.
+	IsEnabled bool `json:"is_enabled"`
+	// MonthlyLimit is the cap in minor units. Nil when uncapped or unknown.
+	MonthlyLimit *int64 `json:"monthly_limit"`
+	// UsedCredits is spend so far in minor units. Nil when unknown.
+	UsedCredits *int64 `json:"used_credits"`
+	// Utilization is the fraction of the cap used. Nil when unknown.
+	Utilization *float64 `json:"utilization"`
+	// Currency is the ISO currency code the amounts are denominated in.
+	Currency *string `json:"currency,omitempty"`
 }
 
 // AssistantContextUsage is the structured twin of the /context report: the data
@@ -354,6 +554,19 @@ type ResultMessage struct {
 	Result string   `json:"result,omitempty"` // Result text (for success)
 	Errors []string `json:"errors,omitempty"` // Error messages (for errors)
 
+	// StartupFailureReason says why Claude Code refused to start, so a host
+	// can offer the fix instead of retrying into the same wall.
+	//
+	// It is set only on the zeroed error_during_execution result a
+	// stream-json run writes before exiting on a KNOWN startup failure;
+	// Errors carries the same text the process put on stderr. Failures that
+	// historically ended with stderr alone write that result at all only when
+	// the host sets CLAUDE_CODE_STARTUP_FAILURE_RESULTS. Absent on every
+	// other result, on startup failures with no recognized cause, and from
+	// producers older than v0.3.278 — so empty means "no machine-readable
+	// cause", never "started fine" (sdk.d.ts v0.3.278 L5388).
+	StartupFailureReason StartupFailureReason `json:"startup_failure_reason,omitempty"`
+
 	DurationMs    int64 `json:"duration_ms,omitempty"`     // Total duration in milliseconds
 	DurationAPIMs int64 `json:"duration_api_ms,omitempty"` // API call duration in milliseconds
 	TTFTMs        int64 `json:"ttft_ms,omitempty"`         // Time-to-first-token in milliseconds
@@ -370,9 +583,13 @@ type ResultMessage struct {
 	// upstream (sdk.d.ts L4799), where it rides alone because an error turn
 	// has no RequestSentWallMs to report.
 	//
-	// Empty on synthetic and scheduled turns, on turns the caller sent no
-	// uuid for, on session-scoped failures with no single triggering send
-	// (a crashed worker's zeroed result), and from older producers.
+	// A synthetic or scheduled (meta) turn echoes its own uuid only when the
+	// host vouches it is the client event's own; a meta turn that folded
+	// queued user messages in mid-run echoes the LAST of them instead. Empty
+	// on turns that neither had a client uuid nor folded a message in, on
+	// session-scoped failures with no single triggering send (a crashed
+	// worker's zeroed result), and from older producers (sdk.d.ts v0.3.270
+	// L5305).
 	UserMessageUUID string `json:"user_message_uuid,omitempty"`
 	// UserMessageUUIDs lists the client uuids of every user message this turn
 	// consumed, in consumption order: a merged prompt batch (whose singular
@@ -384,25 +601,63 @@ type ResultMessage struct {
 	// and zeroed results and from older producers, where you fall back to the
 	// singular field. Carried on both result variants, like the singular field
 	// (sdk.d.ts v0.3.263 L4991 error, L5014 success).
-	UserMessageUUIDs         []string `json:"user_message_uuids,omitempty"`
-	RequestSentWallMs        *int64   `json:"request_sent_wall_ms,omitempty"`          // Wall-clock time the request was sent, ms since epoch (success only; sdk.d.ts v0.3.220 L4301)
-	FirstContentFrameMs      *int64   `json:"first_content_frame_ms,omitempty"`        // Time to the first content frame, relative to TimeOriginMs (success only; sdk.d.ts v0.3.263 L5016)
-	FirstStreamPostMs        *int64   `json:"first_stream_post_ms,omitempty"`          // Time to the first stream post, relative to TimeOriginMs (success only; sdk.d.ts v0.3.263 L5017)
-	FirstStreamPostAckMs     *int64   `json:"first_stream_post_ack_ms,omitempty"`      // Time to that post being acked, relative to TimeOriginMs (success only; sdk.d.ts v0.3.263 L5018)
-	FirstStreamPostWallMs    *int64   `json:"first_stream_post_wall_ms,omitempty"`     // Wall-clock time of the first stream post, ms since epoch (success only; sdk.d.ts v0.3.263 L5019)
-	TimeToRequestFromSpawnMs *int64   `json:"time_to_request_from_spawn_ms,omitempty"` // Time to request from spawn in milliseconds
-	WarmSpareClaimed         *bool    `json:"warm_spare_claimed,omitempty"`            // Whether a warm spare was claimed
-	TimeOriginMs             *int64   `json:"time_origin_ms,omitempty"`                // Wall-clock origin for the above timings, in milliseconds (success only)
-	IsError                  bool     `json:"is_error,omitempty"`                      // Whether this is an error result
-	NumTurns                 int      `json:"num_turns,omitempty"`                     // Number of conversation turns
+	UserMessageUUIDs []string `json:"user_message_uuids,omitempty"`
+	// ResumeReason says why this turn was the automatic re-run of a turn a
+	// worker restart interrupted. Present on a headless re-run's result,
+	// success or error, with or without an echoed UserMessageUUID — a re-run
+	// whose opener could not be vouched still carries the reason. Empty on
+	// every other turn, on the Remote Control bridge's per-turn synthetic
+	// results, and from older producers. See the ResumeReason* constants
+	// (sdk.d.ts v0.3.270 L5315 error, L5343 success).
+	ResumeReason         string `json:"resume_reason,omitempty"`
+	RequestSentWallMs    *int64 `json:"request_sent_wall_ms,omitempty"`     // Wall-clock time the request was sent, ms since epoch (success only; sdk.d.ts v0.3.220 L4301)
+	FirstContentFrameMs  *int64 `json:"first_content_frame_ms,omitempty"`   // Time to the first content frame, relative to TimeOriginMs (success only; sdk.d.ts v0.3.263 L5016)
+	FirstStreamPostMs    *int64 `json:"first_stream_post_ms,omitempty"`     // Time to the first stream post, relative to TimeOriginMs (success only; sdk.d.ts v0.3.263 L5017)
+	FirstStreamPostAckMs *int64 `json:"first_stream_post_ack_ms,omitempty"` // Time to that post being acked, relative to TimeOriginMs (success only; sdk.d.ts v0.3.263 L5018)
+	// FirstStreamPostQueueWaitMs is how long the first stream post waited in
+	// the queue before being sent, so the gap between FirstContentFrameMs and
+	// FirstStreamPostMs can be split into queueing versus everything else
+	// (success only; sdk.d.ts v0.3.278 L5434).
+	FirstStreamPostQueueWaitMs *int64 `json:"first_stream_post_queue_wait_ms,omitempty"`
+	// FirstStreamPostQueuedBehind says what the first stream post waited on.
+	// See the FirstPostQueuedBehind* constants; "none" means it did not wait,
+	// which is distinct from the field being absent (success only; sdk.d.ts
+	// v0.3.278 L5435).
+	FirstStreamPostQueuedBehind FirstPostQueuedBehind `json:"first_stream_post_queued_behind,omitempty"`
+	FirstStreamPostWallMs       *int64                `json:"first_stream_post_wall_ms,omitempty"` // Wall-clock time of the first stream post, ms since epoch (success only; sdk.d.ts v0.3.263 L5019)
+	// FirstTextPostMs is the time to the first post carrying assistant text,
+	// relative to TimeOriginMs. It trails FirstStreamPostMs whenever the
+	// first post out was something else, so the two together separate "the
+	// stream opened" from "the user saw words" (success only; sdk.d.ts
+	// v0.3.278 L5440).
+	FirstTextPostMs *int64 `json:"first_text_post_ms,omitempty"`
+	// FirstTextPostWallMs is the wall-clock time of that first text post, ms
+	// since epoch (success only; sdk.d.ts v0.3.278 L5441).
+	FirstTextPostWallMs *int64 `json:"first_text_post_wall_ms,omitempty"`
+	// FirstTextPostQueueWaitMs is how long the first text post waited in the
+	// queue before being sent; the FirstTextPostMs counterpart of
+	// FirstStreamPostQueueWaitMs (success only; sdk.d.ts v0.3.290 L5772).
+	FirstTextPostQueueWaitMs *int64 `json:"first_text_post_queue_wait_ms,omitempty"`
+	// FirstTextPostQueuedBehind says what the first text post waited on,
+	// with the same values and the same "none" versus absent distinction as
+	// FirstStreamPostQueuedBehind (success only; sdk.d.ts v0.3.290 L5773).
+	FirstTextPostQueuedBehind FirstPostQueuedBehind `json:"first_text_post_queued_behind,omitempty"`
+	TimeToRequestFromSpawnMs  *int64                `json:"time_to_request_from_spawn_ms,omitempty"` // Time to request from spawn in milliseconds
+	WarmSpareClaimed          *bool                 `json:"warm_spare_claimed,omitempty"`            // Whether a warm spare was claimed
+	TimeOriginMs              *int64                `json:"time_origin_ms,omitempty"`                // Wall-clock origin for the above timings, in milliseconds (success only)
+	IsError                   bool                  `json:"is_error,omitempty"`                      // Whether this is an error result
+	NumTurns                  int                   `json:"num_turns,omitempty"`                     // Number of conversation turns
 
 	// TotalCostUSD is the cumulative estimated cost in USD for this query()
 	// call, covering the same calls as ModelUsage and sharing its lifecycle:
 	// cumulative across turns in streaming-input sessions, so read the latest
 	// result rather than summing across results. Crash and startup-error
-	// results may carry zeroed values, resumed sessions start fresh, and a
-	// mid-session /clear resets the running total. An estimate, not a billing
-	// statement.
+	// results may carry zeroed values; a resumed or forked session continues
+	// from the total its transcript saved, when it has one, so the first
+	// result already carries the earlier turns (MaxBudgetUSD counts only the
+	// spend since this query() call started or last /clear); and a mid-session
+	// /clear resets the running total. An estimate, not a billing statement
+	// (wording corrected in sdk.d.ts v0.3.278 L5366).
 	TotalCostUSD float64 `json:"total_cost_usd,omitempty"`
 
 	// Usage covers the MAIN AGENT LOOP ONLY — it excludes Task subagent,
@@ -439,12 +694,134 @@ type ResultMessage struct {
 	StructuredOutput interface{}     `json:"structured_output,omitempty"` // Structured output (if OutputFormat set)
 	StopReason       *string         `json:"stop_reason"`                 // Stop reason, explicitly null when absent
 	TerminalReason   *TerminalReason `json:"terminal_reason,omitempty"`   // Terminal completion reason
-	Origin           *MessageOrigin  `json:"origin,omitempty"`            // Originating actor for this result
-	FastModeState    *FastModeState  `json:"fast_mode_state,omitempty"`   // Fast mode state at completion
+	// ResultIndex is this result's delivery sequence within the run: how many
+	// results the run numbered before it, starting at zero, in the order the
+	// process writes them. A result held back while background work finishes
+	// is numbered when it is finally written, not when its text was produced,
+	// and a result whose write fails still consumes its number — so a gap in
+	// a stream-json sequence means a result was lost.
+	//
+	// Distinct from NumTurns, which counts model round-trips within one turn.
+	// Numbered by the process hosting the run: a local client relaying a
+	// cloud session passes the cloud numbering through and its own locally
+	// built error results carry none. Nil from older producers, which is not
+	// the same as index zero (sdk.d.ts v0.3.270 L5320 error, L5382 success).
+	ResultIndex *int `json:"result_index,omitempty"`
+	// LocalCommand names the local slash command this result answers, when
+	// the turn was one. Success results only. Carried opaquely: sdk.d.ts
+	// v0.3.270 L5344 declares it with no documentation and sdk.mjs never
+	// reads it.
+	LocalCommand  string         `json:"local_command,omitempty"`
+	Origin        *MessageOrigin `json:"origin,omitempty"`          // Originating actor for this result
+	FastModeState *FastModeState `json:"fast_mode_state,omitempty"` // Fast mode state at completion
 	// FastModeDisabledReason explains why fast mode could not serve, when
 	// fast_mode_state is not "on". Absent when nothing blocks it.
 	FastModeDisabledReason *FastModeDisabledReason `json:"fast_mode_disabled_reason,omitempty"`
 }
+
+// FirstPostQueuedBehind says what the first stream post was waiting on, when
+// it waited at all (sdk.d.ts v0.3.278 L5435).
+//
+// The set is open: treat an unrecognized value as some other queueing cause
+// rather than as no wait. FirstPostQueuedBehindNone is a positive statement
+// that there was no wait, which is not the same as the field being absent —
+// absent means the producer did not report it.
+type FirstPostQueuedBehind string
+
+const (
+	// FirstPostQueuedBehindDurablePost waited on a durable post.
+	FirstPostQueuedBehindDurablePost FirstPostQueuedBehind = "durable_post"
+	// FirstPostQueuedBehindEphemeralPost waited on an ephemeral post.
+	FirstPostQueuedBehindEphemeralPost FirstPostQueuedBehind = "ephemeral_post"
+	// FirstPostQueuedBehindRetryBackoff waited on a retry backoff.
+	FirstPostQueuedBehindRetryBackoff FirstPostQueuedBehind = "retry_backoff"
+	// FirstPostQueuedBehindHold waited on a hold.
+	FirstPostQueuedBehindHold FirstPostQueuedBehind = "hold"
+	// FirstPostQueuedBehindNone did not wait.
+	FirstPostQueuedBehindNone FirstPostQueuedBehind = "none"
+)
+
+// StartupFailureReason is a machine-readable cause for Claude Code refusing to
+// start, carried on the result a stream-json run writes before exiting. See
+// ResultMessage.StartupFailureReason for when it is present.
+//
+// The set is open: a newer CLI may report a cause this SDK predates. Treat an
+// unrecognized value as an unknown startup failure and fall back to Errors,
+// which always carries the human-readable text.
+type StartupFailureReason string
+
+const (
+	// StartupFailureOrgPinAPIKeyConflict means managed settings pin a
+	// first-party or Cloud gateway sign-in, and an Anthropic API key or auth
+	// token is configured instead.
+	// #nosec G101 -- a startup-failure enum value, not a credential.
+	StartupFailureOrgPinAPIKeyConflict StartupFailureReason = "org_pin_api_key_conflict"
+	// StartupFailureProviderNotAllowed means managed settings list the API
+	// providers this machine may use (allowedProviders) and the session is
+	// set up for one that isn't listed.
+	StartupFailureProviderNotAllowed StartupFailureReason = "provider_not_allowed"
+	// StartupFailureOrgVerifyFailed means the sign-in's organization could
+	// not be verified against the pin, through a network failure or a revoked
+	// token.
+	StartupFailureOrgVerifyFailed StartupFailureReason = "org_verify_failed"
+	// StartupFailureOrgPinMismatch means the sign-in belongs to an
+	// organization the pin does not allow.
+	StartupFailureOrgPinMismatch StartupFailureReason = "org_pin_mismatch"
+	// StartupFailureManagedSettingsInvalid means managed policy settings
+	// could not be read, the pin names no organization, or managed model
+	// settings (deniedModels, or an availableModels list matched exactly)
+	// block the default model and leave no allowed model to step down to.
+	StartupFailureManagedSettingsInvalid StartupFailureReason = "managed_settings_invalid"
+	// StartupFailureRemoteSettingsRequiredUnavailable means managed settings
+	// the organization requires could not be loaded.
+	StartupFailureRemoteSettingsRequiredUnavailable StartupFailureReason = "remote_settings_required_unavailable"
+	// StartupFailureGatewaySignInRequired means the Cloud gateway ended this
+	// sign-in.
+	StartupFailureGatewaySignInRequired StartupFailureReason = "gateway_signin_required"
+	// StartupFailureGatewayAccessDenied means the Cloud gateway refused
+	// managed settings for this account.
+	StartupFailureGatewayAccessDenied StartupFailureReason = "gateway_access_denied"
+	// StartupFailureProxyInvalid means a proxy setting is not a complete URL.
+	StartupFailureProxyInvalid StartupFailureReason = "proxy_invalid"
+	// StartupFailureTempDirUnusable means the per-user temp directory is
+	// unsafe or could not be created.
+	StartupFailureTempDirUnusable StartupFailureReason = "temp_dir_unusable"
+	// StartupFailureCwdUnavailable means the working directory was deleted,
+	// moved, or cannot be read.
+	StartupFailureCwdUnavailable StartupFailureReason = "cwd_unavailable"
+	// StartupFailureShellToolMissing means Windows has no shell tool: Git
+	// Bash is missing, and PowerShell is missing or turned off by
+	// CLAUDE_CODE_USE_POWERSHELL_TOOL.
+	StartupFailureShellToolMissing StartupFailureReason = "shell_tool_missing"
+	// StartupFailureSessionHeldByBackground means the conversation to resume
+	// or continue is already running as a background session.
+	StartupFailureSessionHeldByBackground StartupFailureReason = "session_held_by_background"
+	// StartupFailureWorktreeResumeRefused means the resume was refused
+	// because the session's worktree failed its safety checks, or the resume
+	// was launched from inside it. Errors says whether a re-run continues
+	// without the worktree.
+	StartupFailureWorktreeResumeRefused StartupFailureReason = "worktree_resume_refused"
+	// StartupFailureWorktreeUnverified means the session's worktree could not
+	// be verified right now. Retrying may succeed, unlike most causes here.
+	StartupFailureWorktreeUnverified StartupFailureReason = "worktree_unverified"
+	// StartupFailureCLIVersionTooOld means this Claude Code version is below
+	// the minimum Anthropic requires.
+	StartupFailureCLIVersionTooOld StartupFailureReason = "cli_version_too_old"
+	// StartupFailureBypassRoot means bypass permissions mode was requested
+	// while running as root.
+	StartupFailureBypassRoot StartupFailureReason = "bypass_root"
+	// StartupFailureOrgConfigRequiredUnavailable means the organization
+	// requires its policy limits and managed settings before a session
+	// starts, and they could not be loaded (network, proxy, or an Anthropic
+	// error). Retrying may succeed (sdk.d.ts v0.3.296 L5952).
+	StartupFailureOrgConfigRequiredUnavailable StartupFailureReason = "org_config_required_unavailable"
+	// StartupFailureOrgConfigRefused means the organization requires its
+	// policy limits and managed settings, and Anthropic refused them for
+	// this sign-in: an expired or revoked session, or an organization that
+	// does not allow Claude Code for this account. Signing in again or an
+	// admin's change is the fix, not a retry (sdk.d.ts v0.3.296 L5952).
+	StartupFailureOrgConfigRefused StartupFailureReason = "org_config_refused"
+)
 
 // MessageType implements Message.
 func (m ResultMessage) MessageType() string { return "result" }
@@ -510,10 +887,21 @@ type MessageOrigin struct {
 	// instead of re-parsing the message text (sdk.d.ts v0.3.207).
 	Body string `json:"body,omitempty"`
 	// Subkind refines the "task-notification" kind: a scheduled trigger, a
-	// coordinator co-member SendMessage delivery, or a Claude Code Projects
-	// relay. Absent on webhook, PR-steward, plugin, and background-event
-	// deliveries (sdk.d.ts v0.3.241 L4377).
+	// coordinator co-member SendMessage delivery, a Claude Code Projects
+	// relay, or a session-inbox delivery. Absent on webhook, PR-steward,
+	// plugin, and background-event deliveries (sdk.d.ts v0.3.290 L5379).
 	Subkind MessageOriginSubkind `json:"subkind,omitempty"`
+	// FireReason says why a "scheduled-trigger" delivery fired: a short
+	// lowercase token such as "scheduled", "manual", "retry", "catch_up" or
+	// "api". Set by the server for cloud routines, or declared by a local
+	// host for its own scheduled runs (honored only in a process started
+	// with CLAUDE_CODE_HOST_SCHEDULED_RUN=1). Open set; empty when neither
+	// sent one (sdk.d.ts v0.3.290 L5383).
+	FireReason string `json:"fireReason,omitempty"`
+	// RunID is, on a background task's own notification, the run_id its
+	// task_* events carried when the notification was queued. Not part of
+	// the text the model reads (sdk.d.ts v0.3.296 L5435).
+	RunID string `json:"runId,omitempty"`
 }
 
 // MessageOriginSubkind refines a MessageOrigin's kind.
@@ -544,6 +932,10 @@ const (
 	// keeps the generic background-notification frame (sdk.d.ts v0.3.241
 	// L4377).
 	MessageOriginSubkindProjectsRelay MessageOriginSubkind = "projects-relay"
+	// MessageOriginSubkindSessionInbox marks a "task-notification" origin
+	// delivered through the session's inbox. sdk.d.ts v0.3.290 L5379 adds
+	// the value without describing it.
+	MessageOriginSubkindSessionInbox MessageOriginSubkind = "session-inbox"
 )
 
 // PeerFromMode is the sending session's permission class on a "peer" origin.
@@ -664,6 +1056,37 @@ func (d *ThinkingDisplayOverride) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// MaxThinkingTokensValue is the set_max_thinking_tokens budget. A nil Tokens
+// marshals as an explicit null, which resets thinking to the session default;
+// omitting the whole field (a nil *MaxThinkingTokensValue) leaves the budget
+// as it is. Since v0.3.290 the CLI treats those two differently, where it
+// used to read an absent key as null (sdk.d.ts v0.3.290 L5069).
+type MaxThinkingTokensValue struct {
+	Tokens *int
+}
+
+// MarshalJSON implements json.Marshaler.
+func (v MaxThinkingTokensValue) MarshalJSON() ([]byte, error) {
+	if v.Tokens == nil {
+		return []byte("null"), nil
+	}
+	return json.Marshal(*v.Tokens)
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (v *MaxThinkingTokensValue) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		v.Tokens = nil
+		return nil
+	}
+	var tokens int
+	if err := json.Unmarshal(data, &tokens); err != nil {
+		return err
+	}
+	v.Tokens = &tokens
+	return nil
+}
+
 // SDKMCPServerConfig carries per-server settings for an in-process MCP server
 // named in SDKControlRequestBody.SDKMCPServers. The name list stays a bare
 // []string; this map sits beside it and is keyed by the same names
@@ -689,7 +1112,7 @@ type SDKControlRequestBody struct {
 	PlanModeInstructions   string                              `json:"planModeInstructions,omitempty"`   // For initialize
 	ExcludeDynamicSections *bool                               `json:"excludeDynamicSections,omitempty"` // For initialize
 	Agents                 map[string]interface{}              `json:"agents,omitempty"`                 // For initialize
-	Title                  string                              `json:"title,omitempty"`                  // For initialize
+	Title                  string                              `json:"title,omitempty"`                  // For initialize/rename_session
 	Skills                 []string                            `json:"skills,omitempty"`                 // For initialize
 	PromptSuggestions      *bool                               `json:"promptSuggestions,omitempty"`      // For initialize
 	AgentProgressSummaries *bool                               `json:"agentProgressSummaries,omitempty"` // For initialize
@@ -710,39 +1133,46 @@ type SDKControlRequestBody struct {
 
 	// Inbound can_use_tool context. These describe how the ask reached the
 	// host and constrain how it may be rendered; see PermissionContext.
-	RequiresUserInteraction bool            `json:"requires_user_interaction,omitempty"`
-	SuppressAlwaysAllowRule bool            `json:"suppress_always_allow_rule,omitempty"`
-	DefaultToNo             bool            `json:"default_to_no,omitempty"`
-	MatchedAskRule          *MatchedAskRule `json:"matched_ask_rule,omitempty"`
+	RequiresUserInteraction bool                 `json:"requires_user_interaction,omitempty"`
+	SuppressAlwaysAllowRule bool                 `json:"suppress_always_allow_rule,omitempty"`
+	DefaultToNo             bool                 `json:"default_to_no,omitempty"`
+	MatchedAskRule          *MatchedAskRule      `json:"matched_ask_rule,omitempty"`
+	MCPServer               *MCPServerProvenance `json:"mcp_server,omitempty"`
 
-	CallbackID        string                      `json:"callback_id,omitempty"`         // For hook_callback
-	Mode              string                      `json:"mode,omitempty"`                // For set_permission_mode
-	Model             string                      `json:"model,omitempty"`               // For set_model
-	MaxThinkingTokens *int                        `json:"max_thinking_tokens,omitempty"` // For set_max_thinking_tokens
-	ThinkingDisplay   *ThinkingDisplayOverride    `json:"thinking_display,omitempty"`    // For set_max_thinking_tokens
-	Directory         string                      `json:"directory,omitempty"`           // For register_repo_root
-	ReloadClaudeMD    *bool                       `json:"reload_claude_md,omitempty"`    // For register_repo_root
-	ReloadPlugins     *bool                       `json:"reload_plugins,omitempty"`      // For register_repo_root
-	ReloadSkills      *bool                       `json:"reload_skills,omitempty"`       // For register_repo_root
-	UserMessageID     string                      `json:"user_message_id,omitempty"`     // For rewind_files
-	DryRun            *bool                       `json:"dry_run,omitempty"`             // For rewind_files
-	CancelQueued      *bool                       `json:"cancel_queued,omitempty"`       // For interrupt (interrupt_cancel_queued_v1)
-	Path              string                      `json:"path,omitempty"`                // For read_file/seed_read_state
-	MaxBytes          *int                        `json:"max_bytes,omitempty"`           // For read_file
-	Encoding          string                      `json:"encoding,omitempty"`            // For read_file ("utf-8"|"base64")
-	MTime             *int64                      `json:"mtime,omitempty"`               // For seed_read_state
-	Settings          *map[string]interface{}     `json:"settings,omitempty"`            // For apply_flag_settings/update_settings
-	SettingsSource    string                      `json:"source,omitempty"`              // For update_settings
-	Description       string                      `json:"description,omitempty"`         // For submit_feedback
-	Surface           string                      `json:"surface,omitempty"`             // For submit_feedback
-	TaskID            string                      `json:"task_id,omitempty"`             // For stop_task
-	ServerName        string                      `json:"server_name,omitempty"`         // For mcp_message (snake_case)
-	MCPServerName     string                      `json:"serverName,omitempty"`          // For mcp_reconnect/mcp_toggle/mcp_set_servers (camelCase)
-	Enabled           *bool                       `json:"enabled,omitempty"`             // For mcp_toggle (pointer so explicit false serializes)
-	Servers           *map[string]MCPServerConfig `json:"servers,omitempty"`             // For mcp_set_servers (pointer so nil/empty round-trips as {})
-	Message           map[string]interface{}      `json:"message,omitempty"`             // For mcp_message (JSONRPC)
-	Detail            string                      `json:"detail,omitempty"`              // For get_context_usage ("summary"|"full")
-	SkipBehaviors     bool                        `json:"skip_behaviors,omitempty"`      // For get_usage
+	CallbackID        string                   `json:"callback_id,omitempty"`         // For hook_callback
+	Mode              string                   `json:"mode,omitempty"`                // For set_permission_mode
+	Model             string                   `json:"model,omitempty"`               // For set_model
+	MaxThinkingTokens *MaxThinkingTokensValue  `json:"max_thinking_tokens,omitempty"` // For set_max_thinking_tokens
+	ThinkingDisplay   *ThinkingDisplayOverride `json:"thinking_display,omitempty"`    // For set_max_thinking_tokens
+	Directory         string                   `json:"directory,omitempty"`           // For register_repo_root
+	ReloadClaudeMD    *bool                    `json:"reload_claude_md,omitempty"`    // For register_repo_root
+	ReloadPlugins     *bool                    `json:"reload_plugins,omitempty"`      // For register_repo_root
+	ReloadSkills      *bool                    `json:"reload_skills,omitempty"`       // For register_repo_root
+	UserMessageID     string                   `json:"user_message_id,omitempty"`     // For rewind_files
+	DryRun            *bool                    `json:"dry_run,omitempty"`             // For rewind_files
+	CancelQueued      *bool                    `json:"cancel_queued,omitempty"`       // For interrupt (interrupt_cancel_queued_v1)
+	Path              string                   `json:"path,omitempty"`                // For read_file/seed_read_state
+	MaxBytes          *int                     `json:"max_bytes,omitempty"`           // For read_file
+	Encoding          string                   `json:"encoding,omitempty"`            // For read_file ("utf-8"|"base64")
+	MTime             *int64                   `json:"mtime,omitempty"`               // For seed_read_state
+	Settings          *map[string]interface{}  `json:"settings,omitempty"`            // For apply_flag_settings/update_settings
+	SettingsSource    string                   `json:"source,omitempty"`              // For update_settings/rename_session
+	// RenameSessionID guards a rename_session against naming the wrong
+	// conversation: when set and this process has since moved to another
+	// session, the CLI refuses the request instead of renaming the new one.
+	RenameSessionID   string                      `json:"session_id,omitempty"`           // For rename_session
+	Description       string                      `json:"description,omitempty"`          // For submit_feedback
+	Surface           string                      `json:"surface,omitempty"`              // For submit_feedback
+	TaskID            string                      `json:"task_id,omitempty"`              // For stop_task/get_task_output
+	ServerName        string                      `json:"server_name,omitempty"`          // For mcp_message (snake_case)
+	MCPServerName     string                      `json:"serverName,omitempty"`           // For mcp_reconnect/mcp_toggle/mcp_set_servers/mcp_read_resource (camelCase)
+	URI               string                      `json:"uri,omitempty"`                  // For mcp_read_resource
+	Enabled           *bool                       `json:"enabled,omitempty"`              // For mcp_toggle (pointer so explicit false serializes)
+	Servers           *map[string]MCPServerConfig `json:"servers,omitempty"`              // For mcp_set_servers (pointer so nil/empty round-trips as {})
+	Message           map[string]interface{}      `json:"message,omitempty"`              // For mcp_message (JSONRPC)
+	Detail            string                      `json:"detail,omitempty"`               // For get_context_usage ("summary"|"full")
+	SkipBehaviors     bool                        `json:"skip_behaviors,omitempty"`       // For get_usage
+	HoldOnCacheImpact bool                        `json:"hold_on_cache_impact,omitempty"` // For reload_plugins
 }
 
 // SDKHookCallbackMatcher defines hook callback matching configuration.
@@ -769,8 +1199,17 @@ type SDKControlResponse struct {
 // PendingPermissionRequests and PendingUserDialogRequests are emitted on
 // both "success" and "error" subtypes. The TS SDK attaches them to the
 // `initialize` response so a client joining an already-initialized session
-// learns about in-flight permission prompts and user dialogs. See sdk.d.ts
-// (v0.3.177) L298-L320.
+// learns about in-flight permission prompts and user dialogs — the
+// can_use_tool and request_user_dialog requests this CLI process has issued
+// and not yet resolved.
+//
+// As of CLI v2.1.268 both are always present (possibly empty) on a success
+// initialize; an earlier CLI could omit them, so a nil slice means an older
+// CLI, not "nothing pending". A prompt inherited from a previous worker of the
+// same session can stay answerable without appearing here and without a
+// control_cancel_request; a session_state of "requires_action" on the same
+// reply signals one the CLI is holding, though not every inherited prompt is
+// signaled. See sdk.d.ts v0.3.270 L306-L333.
 type SDKControlResponseBody struct {
 	Subtype                   string                 `json:"subtype"`                                // "success" or "error"
 	RequestID                 string                 `json:"request_id"`                             // Correlates to request
@@ -881,15 +1320,49 @@ type ActiveGoalValue struct {
 // MessageType implements Message.
 func (m ActiveGoalMessage) MessageType() string { return "active_goal" }
 
-// ConversationResetMessage is emitted by /clear, plan-mode exit, and
-// fresh-session flows. The surface should mount a fresh transcript under
-// NewConversationID and reset any cached session title.
+// ConversationResetMessage is emitted by /clear, plan-mode exit,
+// fresh-session, and onboarding flows. The surface should mount a fresh
+// transcript under NewConversationID and reset any cached session title.
 type ConversationResetMessage struct {
 	Type              string `json:"type"`                // Always "conversation_reset"
 	NewConversationID string `json:"new_conversation_id"` // Conversation ID to mount the fresh transcript under
 	UUID              string `json:"uuid"`                // Unique message ID
 	SessionID         string `json:"session_id"`          // Session identifier
+	// Trigger says what discarded the conversation. It's informational: a
+	// consumer resets on every conversation_reset whatever it says, and
+	// treats an empty (older CLI) or unknown value as an unspecified reset
+	// (sdk.d.ts v0.3.290 L5132).
+	Trigger ConversationResetTrigger `json:"trigger,omitempty"`
+	// UserMessageUUID is set only for ConversationResetTriggerClear: the uuid
+	// of the user message whose /clear ran (the client's own uuid when it
+	// sent one). It lets a consumer match this frame to a /clear it already
+	// saw and wipe once, whichever arrives first, instead of relying on
+	// arrival order. Empty when that uuid is not canonical.
+	UserMessageUUID string `json:"user_message_uuid,omitempty"`
+	// Timestamp is when the reset happened, as an ISO 8601 UTC string from
+	// the clock of the process that performed it. For display only, not for
+	// ordering frames; fall back to receive time when empty.
+	Timestamp string `json:"timestamp,omitempty"`
 }
+
+// ConversationResetTrigger names what discarded a conversation. Open set:
+// compare against the constants, but expect values beyond them.
+type ConversationResetTrigger string
+
+const (
+	// ConversationResetTriggerClear is /clear, or its /reset and /new
+	// aliases.
+	ConversationResetTriggerClear ConversationResetTrigger = "clear"
+	// ConversationResetTriggerPlanModeExit is leaving plan mode with the
+	// clear-context option.
+	ConversationResetTriggerPlanModeExit ConversationResetTrigger = "plan_mode_exit"
+	// ConversationResetTriggerFreshSession is a flow that starts a fresh
+	// session to implement an approved plan.
+	ConversationResetTriggerFreshSession ConversationResetTrigger = "fresh_session"
+	// ConversationResetTriggerOnboarding is an onboarding flow re-run inside
+	// an existing session.
+	ConversationResetTriggerOnboarding ConversationResetTrigger = "onboarding"
+)
 
 // MessageType implements Message.
 func (m ConversationResetMessage) MessageType() string { return "conversation_reset" }
@@ -912,6 +1385,22 @@ const (
 	RateLimitStatusAllowed        RateLimitStatus = "allowed"
 	RateLimitStatusAllowedWarning RateLimitStatus = "allowed_warning"
 	RateLimitStatusRejected       RateLimitStatus = "rejected"
+)
+
+// RateLimitScope names which spend limit blocked a request, when the limit
+// that bit was not the member's own cap (sdk.d.ts v0.3.270 L5270).
+type RateLimitScope string
+
+const (
+	// RateLimitScopeService means a service-wide spend limit blocked it.
+	RateLimitScopeService RateLimitScope = "service"
+	// RateLimitScopeChannel means a per-channel spend limit blocked it.
+	RateLimitScopeChannel RateLimitScope = "channel"
+	// RateLimitScopeGroupPool means a pooled group budget shared by the
+	// member's team is used up. Without this the denial is indistinguishable
+	// from the member exhausting their own monthly cap, which is the wrong
+	// thing to tell the user.
+	RateLimitScopeGroupPool RateLimitScope = "group_pool"
 )
 
 // TerminalReason explains why a result message reached a terminal state.
@@ -1015,7 +1504,20 @@ type RateLimitInfo struct {
 	OverageDisabledReason *RateLimitOverageDisabledReason `json:"overageDisabledReason,omitempty"`
 	IsUsingOverage        *bool                           `json:"isUsingOverage,omitempty"`
 	OverageInUse          *bool                           `json:"overageInUse,omitempty"`
-	SurpassedThreshold    *float64                        `json:"surpassedThreshold,omitempty"`
+	// OverageEnabled reports whether overage is turned on for the account
+	// at all, independent of whether it is in use right now (sdk.d.ts
+	// v0.3.296 L5715).
+	OverageEnabled     *bool    `json:"overageEnabled,omitempty"`
+	SurpassedThreshold *float64 `json:"surpassedThreshold,omitempty"`
+	// LimitScope names which spend limit blocked the request when it is not
+	// the member's own cap. RateLimitScopeGroupPool in particular means a
+	// pooled group budget shared by the member's team is used up — a denial
+	// that otherwise looks identical to hitting one's own monthly cap, so a
+	// host telling the user what to do about it has to branch on this.
+	//
+	// Empty on a plain member denial and from older CLIs (sdk.d.ts v0.3.270
+	// L5270).
+	LimitScope RateLimitScope `json:"limitScope,omitempty"`
 	// ErrorCode signals a credit-exhaustion condition; the only defined value
 	// is "credits_required". Open string for forward compatibility.
 	ErrorCode string `json:"errorCode,omitempty"`
@@ -1112,13 +1614,20 @@ type SystemMessage struct {
 	// cases, showing everything is the safe fallback (sdk.d.ts v0.3.233
 	// L4712).
 	TerminalSlashCommands []string       `json:"terminal_slash_commands,omitempty"`
-	OutputStyle           string         `json:"output_style"`              // Output formatting style
-	ClaudeCodeVersion     string         `json:"claude_code_version"`       // Claude Code version
-	Skills                []string       `json:"skills"`                    // Available skills
-	Plugins               []SystemPlugin `json:"plugins"`                   // Available plugins
-	Agents                []string       `json:"agents,omitempty"`          // Available agents
-	Betas                 []string       `json:"betas,omitempty"`           // Enabled beta flags
-	FastModeState         *FastModeState `json:"fast_mode_state,omitempty"` // Fast mode state
+	OutputStyle           string         `json:"output_style"`        // Output formatting style
+	ClaudeCodeVersion     string         `json:"claude_code_version"` // Claude Code version
+	Skills                []string       `json:"skills"`              // Available skills
+	Plugins               []SystemPlugin `json:"plugins"`             // Available plugins
+	// PluginErrors lists plugin load-time errors. A plugin that did not load
+	// at all is absent from Plugins; one that loaded without some component
+	// keeps its row and also gets an entry here. Absent when there are no
+	// errors, but also always absent on sessions whose frames are persisted
+	// server-side (Remote Control workers), so an empty slice does not assert
+	// a clean load (sdk.d.ts v0.3.290 L5958).
+	PluginErrors  []SystemPluginError `json:"plugin_errors,omitempty"`
+	Agents        []string            `json:"agents,omitempty"`          // Available agents
+	Betas         []string            `json:"betas,omitempty"`           // Enabled beta flags
+	FastModeState *FastModeState      `json:"fast_mode_state,omitempty"` // Fast mode state
 	// FastModeDisabledReason explains why fast mode could not serve, when
 	// FastModeState is not "on". Absent when nothing blocks it.
 	FastModeDisabledReason *FastModeDisabledReason `json:"fast_mode_disabled_reason,omitempty"`
@@ -1133,6 +1642,14 @@ type SystemMessage struct {
 	// accepts inbound queued_notification stream messages and drains them via
 	// the ReadNotifications tool. Absent on older CLIs.
 	Capabilities []string `json:"capabilities,omitempty"`
+	// ViewMode says whether the transcript is in focus view: "focus" means
+	// the model is told the user sees only its final message per turn, so a
+	// client may collapse each turn to the prompt and the final response.
+	// Toggled by /focus. Published on Remote Control bridge inits and on the
+	// per-turn init of headless stream-json runs; empty on hosts that don't
+	// publish it and on older CLIs. Re-emitted inits carry the current value,
+	// so the newest frame wins (sdk.d.ts v0.3.290 L5982).
+	ViewMode ViewMode `json:"view_mode,omitempty"`
 	// Effort is the effort level the session will send on its next request,
 	// after env overrides, session state, org caps and model-support
 	// downgrades — the same value get_settings reports as applied.effort.
@@ -1149,6 +1666,17 @@ type SystemMessage struct {
 	// value, so the newest frame wins (sdk.d.ts v0.3.241 L4816).
 	Effort NullableEffortLevel `json:"effort,omitzero"`
 }
+
+// ViewMode is the transcript view the init message reports.
+type ViewMode string
+
+const (
+	// ViewModeFocus means the model is told the user sees only its final
+	// message per turn.
+	ViewModeFocus ViewMode = "focus"
+	// ViewModeDefault is the ordinary transcript view.
+	ViewModeDefault ViewMode = "default"
+)
 
 // NullableEffortLevel carries a wire field where an explicit JSON null means
 // something other than "absent".
@@ -1193,12 +1721,45 @@ func (m SystemMessage) MessageType() string { return "system" }
 type MCPServerInfo struct {
 	Name   string `json:"name"`   // Server name
 	Status string `json:"status"` // Connection status
+	// Source is where the server definition came from, the same values
+	// McpServerStatus.Source carries. Empty on CLIs that predate the field,
+	// which means unknown rather than "not an SDK server" (sdk.d.ts v0.3.278
+	// L5599).
+	Source MCPServerSource `json:"source,omitempty"`
+}
+
+// IsSDK reports whether the server is an in-process one this SDK host
+// registered. Mirrors MCPServerProvenance.IsSDK.
+func (i MCPServerInfo) IsSDK() bool {
+	return i.Source == MCPServerSourceSDK
 }
 
 // SystemPlugin contains metadata for an installed Claude Code plugin.
 type SystemPlugin struct {
 	Name string `json:"name"`
 	Path string `json:"path"`
+	// Version is the version the plugin's plugin.json declares, verbatim.
+	// It's plugin-author-controlled, so validate before trusting it. Empty
+	// when the manifest declares none.
+	Version string `json:"version,omitempty"`
+}
+
+// SystemPluginError is one plugin load-time error on the init message.
+type SystemPluginError struct {
+	// Plugin is name@marketplace, or the positional inline[N] / synced[N]
+	// tag for a directory entry that failed before it had a name.
+	Plugin string `json:"plugin"`
+	// Type is a category from an open set (path-not-found, generic-error,
+	// manifest-validation-error, dependency-unsatisfied, hook-load-failed,
+	// ...); treat a value you don't recognize as a generic failure.
+	Type string `json:"type"`
+	// Message is display text.
+	Message string `json:"message"`
+	// Path is set only when a --plugin-dir, SDK plugins or synced directory
+	// entry did not load at all: that entry's path resolved against the cwd,
+	// which is how a host mounting several directories pairs the error with
+	// its own entry.
+	Path string `json:"path,omitempty"`
 }
 
 // PartialAssistantMessage represents a streaming partial message.
@@ -1235,6 +1796,12 @@ type PartialAssistantMessage struct {
 	// first non-ping stream event; absent from older producers, where you fall
 	// back to the singular field (sdk.d.ts v0.3.263 L4843).
 	UserMessageUUIDs []string `json:"user_message_uuids,omitempty"`
+
+	// ResumeReason says why this frame's turn is the automatic re-run of a
+	// turn a worker restart interrupted. It rides the same frames as
+	// UserMessageUUID. Empty on every other turn and from older producers.
+	// See the ResumeReason* constants (sdk.d.ts v0.3.270 L5111).
+	ResumeReason string `json:"resume_reason,omitempty"`
 }
 
 // MessageType implements Message.
@@ -1330,6 +1897,18 @@ const (
 	TaskNotificationStatusStopped   TaskNotificationStatus = "stopped"
 )
 
+// TaskEndReason is the machine-readable cause on TaskNotificationMessage.Reason,
+// set only when a task did not end through an ordinary completion, failure, or
+// stop.
+type TaskEndReason string
+
+const (
+	// TaskEndReasonWorkerRestart means the worker process restarted and the
+	// resumed process found the task orphaned; it always accompanies
+	// TaskNotificationStatusStopped.
+	TaskEndReasonWorkerRestart TaskEndReason = "worker_restart"
+)
+
 // TaskRunStatus is the running status carried in TaskUpdatePatch.Status.
 //
 // Distinct from TaskNotificationStatus: the notification set is a subset oriented
@@ -1347,9 +1926,18 @@ const (
 
 // TaskStartedMessage reports that a task has started executing.
 type TaskStartedMessage struct {
-	Type         string `json:"type"`                    // Always "system"
-	Subtype      string `json:"subtype"`                 // "task_started"
-	TaskID       string `json:"task_id"`                 // Task identifier
+	Type    string `json:"type"`    // Always "system"
+	Subtype string `json:"subtype"` // "task_started"
+	TaskID  string `json:"task_id"` // Task identifier
+	// RunID identifies one run of the task: equal on every task_* event,
+	// background_tasks_changed entry and saved notification
+	// (MessageOrigin.RunID) of that run. A resumed task keeps its TaskID and
+	// gets a new RunID. The run ids of one task sort, by plain string
+	// comparison, in the order the runs opened, so a frame naming a run that
+	// sorts before the one a reader shows is late. Nothing else about the
+	// format is promised. Empty for a task this process did not register and
+	// on CLIs that predate the field (sdk.d.ts v0.3.296 L6129).
+	RunID        string `json:"run_id,omitempty"`
 	ToolUseID    string `json:"tool_use_id,omitempty"`   // Related tool use ID
 	Description  string `json:"description"`             // Task description
 	SubagentType string `json:"subagent_type,omitempty"` // Subagent type for Task tool subagents
@@ -1381,9 +1969,17 @@ type TaskStartedMessage struct {
 	// SpawnDepth is the nesting depth of a spawned subagent (local_agent)
 	// task: 1 for a top-level spawn, N+1 when spawned from inside a depth-N
 	// agent. Not set on other task types (sdk.d.ts v0.3.241 L4887).
-	SpawnDepth *int   `json:"spawn_depth,omitempty"`
-	UUID       string `json:"uuid"`       // Unique message ID
-	SessionID  string `json:"session_id"` // Session identifier
+	SpawnDepth *int `json:"spawn_depth,omitempty"`
+	// ParentTaskID is the task_id of the subagent (local_agent) task whose
+	// agent launched this subagent, shell, monitor or workflow task. Empty
+	// when the launcher is the main thread, has no task_id of its own (a
+	// teammate, an agent inside a workflow), or is no longer tracked. A
+	// resumed subagent keeps its original parent. The parent may be a
+	// foreground or already-ended task, so treat an unknown id as no parent
+	// (sdk.d.ts v0.3.296 L6148).
+	ParentTaskID string `json:"parent_task_id,omitempty"`
+	UUID         string `json:"uuid"`       // Unique message ID
+	SessionID    string `json:"session_id"` // Session identifier
 }
 
 // MessageType implements Message.
@@ -1391,9 +1987,12 @@ func (m TaskStartedMessage) MessageType() string { return "system" }
 
 // TaskProgressMessage reports intermediate task progress and usage.
 type TaskProgressMessage struct {
-	Type         string    `json:"type"`                     // Always "system"
-	Subtype      string    `json:"subtype"`                  // "task_progress"
-	TaskID       string    `json:"task_id"`                  // Task identifier
+	Type    string `json:"type"`    // Always "system"
+	Subtype string `json:"subtype"` // "task_progress"
+	TaskID  string `json:"task_id"` // Task identifier
+	// RunID identifies one run of the task; see TaskStartedMessage.RunID
+	// (sdk.d.ts v0.3.296 L6100).
+	RunID        string    `json:"run_id,omitempty"`
 	ToolUseID    string    `json:"tool_use_id,omitempty"`    // Related tool use ID
 	Description  string    `json:"description"`              // Task description
 	SubagentType string    `json:"subagent_type,omitempty"`  // Subagent type for Task tool subagents
@@ -1421,9 +2020,12 @@ type TaskUpdatePatch struct {
 
 // TaskUpdatedMessage reports changes to task state.
 type TaskUpdatedMessage struct {
-	Type      string          `json:"type"`       // Always "system"
-	Subtype   string          `json:"subtype"`    // "task_updated"
-	TaskID    string          `json:"task_id"`    // Task identifier
+	Type    string `json:"type"`    // Always "system"
+	Subtype string `json:"subtype"` // "task_updated"
+	TaskID  string `json:"task_id"` // Task identifier
+	// RunID identifies one run of the task; see TaskStartedMessage.RunID
+	// (sdk.d.ts v0.3.296 L6174).
+	RunID     string          `json:"run_id,omitempty"`
 	Patch     TaskUpdatePatch `json:"patch"`      // Updated task fields
 	UUID      string          `json:"uuid"`       // Unique message ID
 	SessionID string          `json:"session_id"` // Session identifier
@@ -1434,14 +2036,23 @@ func (m TaskUpdatedMessage) MessageType() string { return "system" }
 
 // TaskNotificationMessage reports terminal task output.
 type TaskNotificationMessage struct {
-	Type       string                 `json:"type"`                  // Always "system"
-	Subtype    string                 `json:"subtype"`               // "task_notification"
-	TaskID     string                 `json:"task_id"`               // Task identifier
-	ToolUseID  string                 `json:"tool_use_id,omitempty"` // Related tool use ID
-	Status     TaskNotificationStatus `json:"status"`                // Terminal status
-	OutputFile string                 `json:"output_file"`           // Output file path
-	Summary    string                 `json:"summary"`               // Task summary
-	Usage      *TaskUsage             `json:"usage,omitempty"`       // Resource consumption
+	Type    string `json:"type"`    // Always "system"
+	Subtype string `json:"subtype"` // "task_notification"
+	TaskID  string `json:"task_id"` // Task identifier
+	// RunID identifies one run of the task; see TaskStartedMessage.RunID
+	// (sdk.d.ts v0.3.296 L6064).
+	RunID     string                 `json:"run_id,omitempty"`
+	ToolUseID string                 `json:"tool_use_id,omitempty"` // Related tool use ID
+	Status    TaskNotificationStatus `json:"status"`                // Terminal status
+	// Reason is a machine-readable cause, set only when the task did not end
+	// through an ordinary completion, failure, or stop. TaskEndReasonWorkerRestart
+	// means the worker process restarted and the resumed process found the task
+	// orphaned (always with Status TaskNotificationStatusStopped). Absent
+	// otherwise and on CLIs that predate the field (sdk.d.ts v0.3.278 L5654).
+	Reason     TaskEndReason `json:"reason,omitempty"`
+	OutputFile string        `json:"output_file"`     // Output file path
+	Summary    string        `json:"summary"`         // Task summary
+	Usage      *TaskUsage    `json:"usage,omitempty"` // Resource consumption
 	// ResourceLinks carries the resource_link content blocks of a
 	// backgrounded MCP task's final result — the files it returned by
 	// reference. A backgrounded task's tool_result is placeholder text and
@@ -1919,7 +2530,8 @@ func (m ControlRequestProgressMessage) MessageType() string { return "system" }
 
 // BackgroundTasksChangedMessage carries the full set of live background tasks,
 // emitted whenever membership changes (start, completion, kill, a foreground
-// agent being backgrounded). REPLACE semantics: swap the tracked set for Tasks
+// agent being backgrounded) or an entry's ambient flag or parent_task_id
+// changes. REPLACE semantics: swap the tracked set for Tasks
 // on each message. It is a level signal, not an edge, and is per-process — reset
 // the set to empty whenever the CLI process restarts.
 type BackgroundTasksChangedMessage struct {
@@ -1933,9 +2545,21 @@ type BackgroundTasksChangedMessage struct {
 // BackgroundTask identifies one live background task in a
 // BackgroundTasksChangedMessage.
 type BackgroundTask struct {
-	TaskID      string `json:"task_id"`
-	TaskType    string `json:"task_type"`
-	Description string `json:"description"`
+	TaskID string `json:"task_id"`
+	// RunID identifies the run of the task this entry describes; see
+	// TaskStartedMessage.RunID (sdk.d.ts v0.3.296 L3742).
+	RunID    string `json:"run_id,omitempty"`
+	TaskType string `json:"task_type"`
+	// SubagentType is the agent type of a local_agent task, such as
+	// "general-purpose" or a custom agent's name; "main-session" for a
+	// backgrounded main session. Empty on other tasks (sdk.d.ts v0.3.296
+	// L3746).
+	SubagentType string `json:"subagent_type,omitempty"`
+	Description  string `json:"description"`
+	// ParentTaskID is the launching subagent's task_id; see
+	// TaskStartedMessage.ParentTaskID. A change to it re-emits the level
+	// (sdk.d.ts v0.3.296 L3752).
+	ParentTaskID string `json:"parent_task_id,omitempty"`
 
 	// Ambient marks a housekeeping task the CLI does not surface as user
 	// work — every skip_transcript task, plus auto-started live-update
@@ -1997,9 +2621,13 @@ type InformationalMessage struct {
 	ToolUseID string `json:"tool_use_id,omitempty"`
 	// PreventContinuation, when true, stops execution after this message
 	// (e.g. a Stop hook denied continuation).
-	PreventContinuation bool   `json:"prevent_continuation,omitempty"`
-	UUID                string `json:"uuid"`       // Unique message ID
-	SessionID           string `json:"session_id"` // Session identifier
+	PreventContinuation bool `json:"prevent_continuation,omitempty"`
+	// Tag is an opaque feature tag on a line a host may treat specially;
+	// empty on ordinary lines. Ignore values you don't know (sdk.d.ts
+	// v0.3.290 L5261).
+	Tag       string `json:"tag,omitempty"`
+	UUID      string `json:"uuid"`       // Unique message ID
+	SessionID string `json:"session_id"` // Session identifier
 }
 
 // MessageType implements Message.

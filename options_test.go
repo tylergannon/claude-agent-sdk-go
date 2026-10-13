@@ -60,6 +60,30 @@ func TestSettingsHookArgsJSON(t *testing.T) {
 	})
 }
 
+func TestSettingsHookOnFailureJSON(t *testing.T) {
+	data, err := json.Marshal(SettingsHook{
+		Type:      "command",
+		Command:   "exit 1",
+		OnFailure: SettingsHookOnFailureBlock,
+	})
+	require.NoError(t, err)
+	assert.JSONEq(t,
+		`{"type":"command","command":"exit 1","onFailure":"block"}`,
+		string(data),
+	)
+
+	var cfg SettingsHook
+	require.NoError(t, json.Unmarshal(
+		[]byte(`{"type":"http","url":"https://x","onFailure":"continue"}`),
+		&cfg,
+	))
+	assert.Equal(t, SettingsHookOnFailureContinue, cfg.OnFailure)
+
+	data, err = json.Marshal(SettingsHook{Type: "command", Command: "true"})
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "onFailure")
+}
+
 func TestSettingsHookContinueOnBlockJSON(t *testing.T) {
 	t.Run("marshal includes true", func(t *testing.T) {
 		continueOnBlock := true
@@ -1364,6 +1388,31 @@ func TestSettingsMarketplaceSourceVariants(t *testing.T) {
 		assert.Len(t, got, 1)
 	})
 
+	t.Run("npm source round-trips with version and registry", func(t *testing.T) {
+		in := Settings{
+			ExtraKnownMarketplaces: map[string]SettingsMarketplace{
+				"acme": {
+					Source: SettingsMarketplaceSource{
+						"source":   string(SettingsMarketplaceSourceNPM),
+						"package":  "@acme/claude-marketplace",
+						"version":  "^1.4",
+						"registry": "https://npm.example.com/api/npm/internal/",
+					},
+				},
+			},
+		}
+		data, err := json.Marshal(in)
+		require.NoError(t, err)
+
+		var out Settings
+		require.NoError(t, json.Unmarshal(data, &out))
+		got := out.ExtraKnownMarketplaces["acme"].Source
+		assert.Equal(t, "npm", got["source"])
+		assert.Equal(t, "@acme/claude-marketplace", got["package"])
+		assert.Equal(t, "^1.4", got["version"])
+		assert.Equal(t, "https://npm.example.com/api/npm/internal/", got["registry"])
+	})
+
 	t.Run("archive source round-trips with url and sha256", func(t *testing.T) {
 		in := Settings{
 			ExtraKnownMarketplaces: map[string]SettingsMarketplace{
@@ -2472,5 +2521,176 @@ func TestSettingsParityV0_3_263OmitEmpty(t *testing.T) {
 		"managedMcpServers",
 	} {
 		assert.NotContains(t, got, key)
+	}
+}
+
+func TestSettingsParityV0_3_270(t *testing.T) {
+	bashEditDiff := false
+
+	settings := Settings{
+		BashEditDiffEnabled:     &bashEditDiff,
+		PrependPlugins:          []string{"sec-default@builtin", "audit@corp"},
+		AppendPlugins:           []string{"telemetry@corp"},
+		GatewayInternalNetworks: []string{"203.0.113.0/24"},
+		MaxEffortLevel:          EffortHigh,
+		ModelSettings: map[string]SettingsModel{
+			"claude-opus-4-7": {MaxEffortLevel: EffortMax},
+		},
+	}
+
+	data, err := json.Marshal(settings)
+	require.NoError(t, err)
+
+	var got map[string]interface{}
+	require.NoError(t, json.Unmarshal(data, &got))
+
+	assert.Equal(t, false, got["bashEditDiffEnabled"])
+	assert.Equal(t,
+		[]interface{}{"sec-default@builtin", "audit@corp"},
+		got["prependPlugins"])
+	assert.Equal(t, []interface{}{"telemetry@corp"}, got["appendPlugins"])
+	assert.Equal(t, []interface{}{"203.0.113.0/24"}, got["gatewayInternalNetworks"])
+	assert.Equal(t, "high", got["maxEffortLevel"])
+
+	models, ok := got["modelSettings"].(map[string]interface{})
+	require.True(t, ok)
+	opus, ok := models["claude-opus-4-7"].(map[string]interface{})
+	require.True(t, ok)
+	// "max" IS a member of the per-model cap, unlike the applied EffortLevel —
+	// it is how a model is exempted from the top-level cap.
+	assert.Equal(t, "max", opus["maxEffortLevel"])
+
+	var back Settings
+	require.NoError(t, json.Unmarshal(data, &back))
+	assert.Equal(t, settings, back)
+}
+
+func TestSettingsParityV0_3_270OmitEmpty(t *testing.T) {
+	data, err := json.Marshal(Settings{})
+	require.NoError(t, err)
+
+	var got map[string]interface{}
+	require.NoError(t, json.Unmarshal(data, &got))
+
+	for _, key := range []string{
+		"bashEditDiffEnabled",
+		"prependPlugins",
+		"appendPlugins",
+		"gatewayInternalNetworks",
+		"maxEffortLevel",
+	} {
+		assert.NotContains(t, got, key)
+	}
+
+	modelData, err := json.Marshal(SettingsModel{})
+	require.NoError(t, err)
+	var gotModel map[string]interface{}
+	require.NoError(t, json.Unmarshal(modelData, &gotModel))
+	assert.NotContains(t, gotModel, "maxEffortLevel")
+}
+
+// TestWithProjectConfigRoot covers the option constructor.
+func TestWithProjectConfigRoot(t *testing.T) {
+	opts := NewOptions()
+	WithProjectConfigRoot("/src/trusted-checkout")(opts)
+	assert.Equal(t, "/src/trusted-checkout", opts.ProjectConfigRoot)
+
+	assert.Empty(t, NewOptions().ProjectConfigRoot)
+}
+
+func TestSettingsParityV0_3_290(t *testing.T) {
+	width := 100
+	idle := false
+	chrome := true
+	s := Settings{
+		AvailableModels:                   []string{"opus"},
+		AvailableModelsMatch:              AvailableModelsMatchExact,
+		DeniedModels:                      []string{"claude-opus-5-5"},
+		AllowClaudeInChromeWithManagedMcp: &chrome,
+		AllowedProviders: []AllowedProvider{
+			AllowedProviderAnthropic, AllowedProviderBedrock,
+		},
+		MaxProseWidth:  &width,
+		IdleCompaction: &idle,
+		ModelSettings: map[string]SettingsModel{
+			"claude-opus-5":   {AutoCompactWindow: &AutoCompactWindow{Auto: true}},
+			"claude-sonnet-5": {AutoCompactWindow: &AutoCompactWindow{Tokens: 400000}},
+		},
+	}
+
+	data, err := json.Marshal(s)
+	require.NoError(t, err)
+
+	var got map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(data, &got))
+	assert.JSONEq(t, `"exact"`, string(got["availableModelsMatch"]))
+	assert.JSONEq(t, `["claude-opus-5-5"]`, string(got["deniedModels"]))
+	assert.JSONEq(t, `true`, string(got["allowClaudeInChromeWithManagedMcp"]))
+	assert.JSONEq(t, `["anthropic","bedrock"]`, string(got["allowedProviders"]))
+	assert.JSONEq(t, `100`, string(got["maxProseWidth"]))
+	assert.JSONEq(t, `false`, string(got["idleCompaction"]))
+	assert.JSONEq(t, `{
+		"claude-opus-5": {"autoCompactWindow": "auto"},
+		"claude-sonnet-5": {"autoCompactWindow": 400000}
+	}`, string(got["modelSettings"]))
+
+	var back Settings
+	require.NoError(t, json.Unmarshal(data, &back))
+	assert.Equal(t, s, back)
+}
+
+// An empty allowedProviders list allows no provider at all, so it must reach
+// the wire; only a nil list means "every provider".
+func TestSettingsAllowedProvidersEmptyVersusNil(t *testing.T) {
+	data, err := json.Marshal(Settings{AllowedProviders: []AllowedProvider{}})
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `"allowedProviders":[]`)
+
+	data, err = json.Marshal(Settings{})
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "allowedProviders")
+}
+
+func TestAutoCompactWindowToleratesUnknownString(t *testing.T) {
+	var m SettingsModel
+	require.NoError(t, json.Unmarshal(
+		[]byte(`{"effortLevel":"high","autoCompactWindow":"huge"}`), &m))
+	assert.Equal(t, EffortLevel("high"), m.EffortLevel)
+	require.NotNil(t, m.AutoCompactWindow)
+	assert.Equal(t, AutoCompactWindow{}, *m.AutoCompactWindow)
+}
+
+// TestSettingsAttributionBoolean covers the boolean arm v0.3.290 adds to
+// attribution (sdk.d.ts L6773).
+func TestSettingsAttributionBoolean(t *testing.T) {
+	data, err := json.Marshal(Settings{
+		Attribution: &SettingsAttribution{HideAll: true, Commit: stringPtr("x")},
+	})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"attribution":false}`, string(data),
+		"HideAll wins over the object fields")
+
+	data, err = json.Marshal(Settings{
+		Attribution: &SettingsAttribution{PR: stringPtr("")},
+	})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"attribution":{"pr":""}}`, string(data))
+
+	tests := []struct {
+		in   string
+		want SettingsAttribution
+	}{
+		{`false`, SettingsAttribution{HideAll: true}},
+		{`true`, SettingsAttribution{}},
+		{`{"commit":"","sessionUrl":false}`, SettingsAttribution{
+			Commit: stringPtr(""), SessionURL: boolPtr(false),
+		}},
+	}
+	for _, tc := range tests {
+		var s Settings
+		require.NoError(t, json.Unmarshal(
+			[]byte(`{"attribution":`+tc.in+`}`), &s), tc.in)
+		require.NotNil(t, s.Attribution, tc.in)
+		assert.Equal(t, tc.want, *s.Attribution, tc.in)
 	}
 }

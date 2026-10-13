@@ -6,6 +6,13 @@ type SlashCommand struct {
 	Description  string   `json:"description"`       // Command description
 	ArgumentHint string   `json:"argumentHint"`      // Hint for command arguments
 	Aliases      []string `json:"aliases,omitempty"` // Alternate names resolving to this command (e.g. /cost and /stats both resolve to /usage)
+	// Builtin is true when the command is Claude Code's own; absent for a
+	// command defined by a user, project, plugin or MCP server. Rows can share
+	// a name: when a marked row carries it, /name runs that one; an unmarked
+	// row is the one /name runs only when no marked row shares its name. The
+	// marker describes the row's name, not its aliases (sdk.d.ts v0.3.278
+	// L8938).
+	Builtin bool `json:"builtin,omitempty"`
 }
 
 // ModelInfo contains information about an available model.
@@ -43,7 +50,14 @@ type SDKControlInitializeResponse struct {
 	AvailableOutputStyles []string       `json:"available_output_styles"`
 	Models                []ModelInfo    `json:"models"`
 	Account               AccountInfo    `json:"account"`
-	FastModeState         string         `json:"fast_mode_state,omitempty"`
+	// ClaudeCodeVersion is the Claude Code version of the process that runs
+	// this session's turns — the same value SystemMessage.ClaudeCodeVersion
+	// carries on system/init, but available before the first turn, so a
+	// caller can gate features straight after Connect. Empty on CLIs that
+	// predate the field, and when the responder is not that process and does
+	// not know its version (sdk.d.ts v0.3.296 L4623).
+	ClaudeCodeVersion string `json:"claude_code_version,omitempty"`
+	FastModeState     string `json:"fast_mode_state,omitempty"`
 	// FastModeDisabledReason explains why fast mode could not serve, when
 	// FastModeState is not "on". Absent when nothing blocks it.
 	FastModeDisabledReason FastModeDisabledReason `json:"fast_mode_disabled_reason,omitempty"`
@@ -86,6 +100,67 @@ type McpServerStatus struct {
 	Name       string         `json:"name"`       // Server name
 	Status     McpServerState `json:"status"`     // Connection state
 	ServerInfo *McpServerInfo `json:"serverInfo"` // Server metadata (if connected)
+	// Source is where the server definition came from. It answers the same
+	// question MCPServerProvenance.Source does on a permission or hook
+	// payload, with the same rule: MCPServerSourceSDK is the only value
+	// meaning an in-process server this host registered, and a configured
+	// server cannot reach it by sharing the name. Empty on CLIs that predate
+	// the field, which means unknown rather than "not an SDK server"
+	// (sdk.d.ts v0.3.278 L1197).
+	Source MCPServerSource `json:"source,omitempty"`
+	// Error describes why the server failed to connect.
+	Error string `json:"error,omitempty"`
+	// Scope is the configuration scope the server was loaded from (project,
+	// user, local, claudeai, managed, ...).
+	Scope string `json:"scope,omitempty"`
+	// Tools are the tools the server provides; populated once it is
+	// connected.
+	Tools []McpServerStatusTool `json:"tools,omitempty"`
+}
+
+// McpServerStatusTool is one tool a connected MCP server provides, as
+// mcp_status reports it.
+type McpServerStatusTool struct {
+	Name        string                    `json:"name"`
+	Description string                    `json:"description,omitempty"`
+	Annotations *McpServerToolAnnotations `json:"annotations,omitempty"`
+	// Meta carries the MCP Apps (SEP-1865) members of the tool's _meta, for a
+	// host that renders the tool's ui:// resource, under the keys the server
+	// used: "ui" (an object with resourceUri, a ui:// string, visibility, an
+	// array of "model" | "app", and any other member the server sent) and the
+	// deprecated flat "ui/resourceUri". The CLI validates and size-bounds
+	// them and withholds every other _meta key. Present only on a tool that
+	// declares one, from CLIs advertising the mcp_tool_ui_meta_v1 capability
+	// (sdk.d.ts v0.3.290 L1280).
+	Meta map[string]interface{} `json:"_meta,omitempty"`
+}
+
+// UIResourceURI returns the ui:// resource the tool declares for MCP Apps
+// rendering, preferring the nested ui.resourceUri over the deprecated flat
+// ui/resourceUri key. Empty when the tool declares neither.
+func (t McpServerStatusTool) UIResourceURI() string {
+	if ui, ok := t.Meta["ui"].(map[string]interface{}); ok {
+		if uri, ok := ui["resourceUri"].(string); ok {
+			return uri
+		}
+	}
+	uri, _ := t.Meta["ui/resourceUri"].(string)
+	return uri
+}
+
+// McpServerToolAnnotations are the behavior hints a server declares for one
+// of its tools.
+type McpServerToolAnnotations struct {
+	ReadOnly    *bool `json:"readOnly,omitempty"`
+	Destructive *bool `json:"destructive,omitempty"`
+	OpenWorld   *bool `json:"openWorld,omitempty"`
+}
+
+// IsSDK reports whether the server is an in-process one this SDK host
+// registered. Mirrors MCPServerProvenance.IsSDK, and is false for the empty
+// source an older CLI reports.
+func (s McpServerStatus) IsSDK() bool {
+	return s.Source == MCPServerSourceSDK
 }
 
 // McpServerState represents MCP server connection states.
@@ -100,12 +175,35 @@ const (
 	McpServerStateNeedsAuth McpServerState = "needs-auth"
 	// McpServerStatePending indicates connection in progress.
 	McpServerStatePending McpServerState = "pending"
+	// McpServerStateDisabled indicates the server is configured but turned
+	// off.
+	McpServerStateDisabled McpServerState = "disabled"
 )
 
 // McpServerInfo contains metadata about a connected MCP server.
 type McpServerInfo struct {
 	Name    string `json:"name"`    // Server name
 	Version string `json:"version"` // Server version
+}
+
+// SDKControlMcpReadResourceResponse is the server's resources/read result for
+// an mcp_read_resource request (sdk.d.ts v0.3.290 L4733).
+type SDKControlMcpReadResourceResponse struct {
+	Contents []McpResourceContents `json:"contents"`
+}
+
+// McpResourceContents is one content item of a resources/read result. Exactly
+// one of Text or Blob is normally set.
+type McpResourceContents struct {
+	URI      string `json:"uri"`
+	MimeType string `json:"mimeType,omitempty"`
+	Text     string `json:"text,omitempty"`
+	// Blob is base64, for a binary item.
+	Blob string `json:"blob,omitempty"`
+	// Meta is the item's own _meta as the server sent it (MCP Apps puts the
+	// resource's ui.csp and ui.permissions here), minus keys under the
+	// CLI-reserved com.anthropic/ prefix.
+	Meta map[string]interface{} `json:"_meta,omitempty"`
 }
 
 // McpSetServersResult is the response from Stream.SetMcpServers.
@@ -163,7 +261,53 @@ type SDKControlReloadPluginsResponse struct {
 	Plugins    []PluginInfo      `json:"plugins"`
 	McpServers []McpServerStatus `json:"mcpServers"`
 	ErrorCount int               `json:"error_count"`
+
+	// Held reports the outcome of the cache-impact check, and is set only
+	// when ReloadPluginsOptions.HoldOnCacheImpact asked for one and the CLI
+	// ran it.
+	//
+	// True: nothing was applied. The lists above describe the session as it
+	// still is, and CacheImpact says what applying would change. False: the
+	// check found no impact and the reload went through. Nil: the request did
+	// not ask, or the CLI predates the option and applied the reload
+	// unchecked — which is not the same as a check that came back clean
+	// (sdk.d.ts v0.3.270 L4564).
+	Held *bool `json:"held,omitempty"`
+
+	// CacheImpact describes what applying the held reload would change in the
+	// session's tool list. Present only alongside Held == true.
+	CacheImpact *ReloadPluginsCacheImpact `json:"cache_impact,omitempty"`
 }
+
+// ReloadPluginsCacheImpact describes the tool-list change a held plugin reload
+// would make. The server names are plugin-authored and scoped
+// plugin:<plugin>:<server> — render-unsafe, so sanitize before display
+// (sdk.d.ts v0.3.270 L4571).
+type ReloadPluginsCacheImpact struct {
+	MCPServersAdded   []string `json:"mcp_servers_added"`
+	MCPServersRemoved []string `json:"mcp_servers_removed"`
+	// LSPToolChange is whether applying would add or remove the LSP tool.
+	// Nil when it would do neither. The "may-" forms mean the preview could
+	// not fully see the pending plugin set, so the change is possible rather
+	// than certain.
+	LSPToolChange *LSPToolChange `json:"lsp_tool_change"`
+}
+
+// LSPToolChange is how a held plugin reload would affect the LSP tool.
+type LSPToolChange string
+
+const (
+	// LSPToolChangeAdds means applying would add the LSP tool.
+	LSPToolChangeAdds LSPToolChange = "adds"
+	// LSPToolChangeMayAdd means applying might add it — the preview could
+	// not fully see the pending plugin set.
+	LSPToolChangeMayAdd LSPToolChange = "may-add"
+	// LSPToolChangeRemoves means applying would remove the LSP tool.
+	LSPToolChangeRemoves LSPToolChange = "removes"
+	// LSPToolChangeMayRemove means applying might remove it, with the same
+	// caveat as LSPToolChangeMayAdd.
+	LSPToolChangeMayRemove LSPToolChange = "may-remove"
+)
 
 // SDKControlReloadSkillsResponse reports refreshed skill commands.
 type SDKControlReloadSkillsResponse struct {
@@ -288,8 +432,12 @@ type UsageRateLimits struct {
 	SevenDayOpus      *UsageRateLimitWindow `json:"seven_day_opus,omitempty"`
 	SevenDaySonnet    *UsageRateLimitWindow `json:"seven_day_sonnet,omitempty"`
 	// ModelScoped holds per-model weekly windows from the server limits[]
-	// array, filtered by the overage-included-models allowlist. Additive —
-	// present only when the server emits them. Mirrors sdk.d.ts v0.3.195 L3088.
+	// array, filtered by the overage-included-models allowlist. Additive, and
+	// nil is not the same as empty: nil means nothing is known about them (an
+	// answer served from cached data, or rows the allowlist hides), while a
+	// present-but-empty slice means the endpoint itself answered and listed no
+	// per-model weekly window for this account, before the allowlist applied
+	// (sdk.d.ts v0.3.270 L4010).
 	ModelScoped []UsageModelScopedWindow `json:"model_scoped,omitempty"`
 	ExtraUsage  *UsageExtraUsage         `json:"extra_usage,omitempty"`
 }
@@ -359,11 +507,20 @@ type UsageAttributionEntry struct {
 	Pct  float64 `json:"pct"` // Share of weighted local usage, 0-100.
 }
 
+// ContextUsageCategory is one row of the get_context_usage report.
 type ContextUsageCategory struct {
+	// Name is the row's English label. Do not classify on it — the CLI is
+	// free to reword these, and Kind is what carries the meaning.
 	Name       string `json:"name"`
 	Tokens     int    `json:"tokens"`
 	Color      string `json:"color"`
 	IsDeferred bool   `json:"isDeferred,omitempty"`
+
+	// Kind is what the row is, the same classification the /context result's
+	// context_usage rows carry (see AssistantContextUsageCategory.Kind).
+	// Required on the wire as of sdk.d.ts v0.3.270 L3675; empty only from a
+	// CLI that predates it, where IsDeferred is the sole usable signal.
+	Kind ContextUsageCategoryKind `json:"kind,omitempty"`
 }
 
 type ContextUsageGridCell struct {
@@ -457,4 +614,275 @@ type ContextUsageAPIUsage struct {
 	OutputTokens             int `json:"output_tokens"`
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+}
+
+// SDKSettingsParseError describes a settings file the CLI skipped because it
+// failed to parse or validate. A file listed here contributed nothing to the
+// session — its rules are neither in effect nor reported anywhere else
+// (sdk.d.ts v0.3.270 L5450).
+type SDKSettingsParseError struct {
+	// File is the path to the settings file that failed. Absent when the CLI
+	// could not attribute the error to a specific file.
+	File string `json:"file,omitempty"`
+	// Path is the dot-notation path to the offending field, or the empty
+	// string for a whole-file error.
+	Path    string `json:"path"`
+	Message string `json:"message"`
+}
+
+// SDKControlListPermissionRulesResponse is the success payload of
+// list_permission_rules.
+type SDKControlListPermissionRulesResponse struct {
+	State SDKControlPermissionRulesState `json:"state"`
+}
+
+// SDKControlPermissionRulesState is the session's live permission rules and
+// workspace directories — the same data /permissions lists in the terminal
+// (sdk.d.ts v0.3.270 L4324).
+type SDKControlPermissionRulesState struct {
+	Rules                []PermissionRuleEntry          `json:"rules"`
+	WorkspaceDirectories []PermissionWorkspaceDirectory `json:"workspaceDirectories"`
+	// OriginalCwd is the session's original working directory.
+	OriginalCwd string `json:"originalCwd"`
+	// ManagedOnly is true when enterprise managed settings pin
+	// allowManagedPermissionRulesOnly: the session applies policy rules only,
+	// and rules from other settings files are still listed but carry
+	// NotInEffect.
+	ManagedOnly bool `json:"managedOnly"`
+	// Errors lists settings files skipped by the merge. When non-empty, those
+	// files' rules are not in the session and not in Rules above.
+	Errors []SDKSettingsParseError `json:"errors,omitempty"`
+}
+
+// PermissionRuleEntry is one permission rule with its provenance and where it
+// lives (sdk.d.ts v0.3.270 L5148).
+type PermissionRuleEntry struct {
+	Behavior PermissionRuleBehavior `json:"behavior"`
+	Source   PermissionRuleSource   `json:"source"`
+	// Rule is the stored rule string VERBATIM, exactly as the session holds
+	// it. Two stored spellings that parse identically each get their own
+	// entry rather than being deduplicated. It can carry invisible or control
+	// characters by design, so escape it before display.
+	Rule string `json:"rule"`
+	// Description is the CLI's plain-language reading of the rule. Nil where
+	// the terminal shows no subtitle either.
+	Description *PermissionRuleDescription `json:"description,omitempty"`
+	Editability PermissionRuleEditability  `json:"editability"`
+	// NotInEffect is true when enterprise managed settings pin
+	// allowManagedPermissionRulesOnly and this rule, read from a non-policy
+	// settings file, is ignored by the session. Such rows are always
+	// PermissionRuleEditabilityReadonly.
+	NotInEffect bool `json:"notInEffect,omitempty"`
+}
+
+// PermissionRuleDescription is the CLI's plain-language reading of a rule
+// (e.g. "Any Bash command starting with npm run"), split so a host can render
+// the rule-derived fragment the way the terminal does — emphasized.
+//
+// Prefix and Suffix are fixed words. Emphasis is rule content, so it needs the
+// same display hygiene as PermissionRuleEntry.Rule: escape invisible
+// characters before rendering (sdk.d.ts v0.3.270 L5143).
+type PermissionRuleDescription struct {
+	Prefix   string `json:"prefix"`
+	Emphasis string `json:"emphasis,omitempty"`
+	Suffix   string `json:"suffix,omitempty"`
+}
+
+// PermissionWorkspaceDirectory is one additional working directory in the
+// permission scope (sdk.d.ts v0.3.270 L5190).
+type PermissionWorkspaceDirectory struct {
+	Path string `json:"path"`
+	// Source is where the directory grant came from: a settings source (e.g.
+	// "localSettings"), "cliArg" (--add-dir), or "session" (/add-dir, IDE
+	// workspace folders).
+	Source string `json:"source"`
+}
+
+// PermissionRuleBehavior is what a permission rule does when it matches.
+type PermissionRuleBehavior string
+
+const (
+	PermissionRuleBehaviorAllow PermissionRuleBehavior = "allow"
+	PermissionRuleBehaviorDeny  PermissionRuleBehavior = "deny"
+	PermissionRuleBehaviorAsk   PermissionRuleBehavior = "ask"
+)
+
+// PermissionRuleSource is where a permission rule came from. It mirrors the
+// CLI's PermissionRuleSource union; upstream keeps a parity test against it,
+// so treat this as closed rather than open.
+type PermissionRuleSource string
+
+const (
+	PermissionRuleSourceUserSettings    PermissionRuleSource = "userSettings"
+	PermissionRuleSourceProjectSettings PermissionRuleSource = "projectSettings"
+	PermissionRuleSourceLocalSettings   PermissionRuleSource = "localSettings"
+	PermissionRuleSourceFlagSettings    PermissionRuleSource = "flagSettings"
+	PermissionRuleSourcePolicySettings  PermissionRuleSource = "policySettings"
+	PermissionRuleSourceCLIArg          PermissionRuleSource = "cliArg"
+	PermissionRuleSourceCommand         PermissionRuleSource = "command"
+	PermissionRuleSourceSession         PermissionRuleSource = "session"
+	PermissionRuleSourceToolsNarrowing  PermissionRuleSource = "toolsNarrowing"
+	PermissionRuleSourceMcpServerPolicy PermissionRuleSource = "mcpServerPolicy"
+	PermissionRuleSourceHostCredential  PermissionRuleSource = "hostCredential" //nolint:gosec // G101: wire enum value, not a credential
+)
+
+// PermissionRuleEditability is where a permission rule lives, and so what
+// changing it would take. Informational only — list_permission_rules never
+// changes rules.
+type PermissionRuleEditability string
+
+const (
+	// PermissionRuleEditabilityPersistent covers user, project and local
+	// settings: the rule is saved in a settings file.
+	PermissionRuleEditabilityPersistent PermissionRuleEditability = "persistent"
+	// PermissionRuleEditabilitySession covers cliArg and session sources: the
+	// rule is in memory only, for the rest of this session.
+	PermissionRuleEditabilitySession PermissionRuleEditability = "session"
+	// PermissionRuleEditabilityReadonly covers policy, flag and command
+	// sources and every other source — the set the terminal's /permissions
+	// treats as read-only.
+	PermissionRuleEditabilityReadonly PermissionRuleEditability = "readonly"
+)
+
+// SDKControlGetTaskOutputResponse answers get_task_output with the tail of a
+// background shell or Monitor task's output (sdk.d.ts v0.3.290 L4222).
+type SDKControlGetTaskOutputResponse struct {
+	// Output is the end of the output decoded as UTF-8; empty when the
+	// command has written nothing yet.
+	Output string `json:"output"`
+	// TotalBytes is the size of the whole output in bytes.
+	TotalBytes int64 `json:"total_bytes"`
+	// Truncated reports that Output holds only the last 8 KiB of a longer
+	// output.
+	Truncated bool `json:"truncated"`
+}
+
+// SDKControlGetHooksListingResponse is the read-only snapshot of the CLI's
+// /hooks menu — settings-file, session and plugin hooks grouped by event and
+// matcher, with display-ready strings and the policy/safe-mode state the menu
+// banners on. A snapshot at request time; re-request when a surface reopens
+// (sdk.d.ts v0.3.270 L3672).
+type SDKControlGetHooksListingResponse struct {
+	// Events are the hook events that have at least one listed hook, in the
+	// /hooks menu's lifecycle order.
+	Events []HooksListingEvent `json:"events"`
+	// Hooks is one row per listed hook: events in lifecycle order, matchers in
+	// the menu's priority order.
+	Hooks []HooksListingHook `json:"hooks"`
+	// EventCatalog is every hook event in lifecycle order — for an add-hook
+	// form — whether or not it currently has hooks.
+	EventCatalog []HooksListingEventCatalogEntry `json:"eventCatalog"`
+	Policy       HooksListingPolicy              `json:"policy"`
+	// SafeMode is present only when the session runs under --safe-mode.
+	SafeMode *HooksListingSafeMode `json:"safeMode,omitempty"`
+	// BareMode is present only under --bare / CLAUDE_CODE_SIMPLE with the hooks
+	// surface gated off: settings-file, flag, policy and plugin hooks never
+	// fire there; session hooks still run.
+	BareMode *HooksListingBareMode `json:"bareMode,omitempty"`
+	// Errors lists settings files skipped by the merge — their hooks are
+	// neither listed above nor running.
+	Errors []SDKSettingsParseError `json:"errors,omitempty"`
+}
+
+// HooksListingEvent summarizes one hook event that has listed hooks.
+type HooksListingEvent struct {
+	Name string `json:"name"`
+	// Summary is the one-line description the /hooks event list shows.
+	Summary string `json:"summary"`
+	// SupportsMatcher is whether hooks on this event can carry a matcher.
+	SupportsMatcher bool `json:"supportsMatcher"`
+	// HookCount is the number of listed hooks on this event.
+	HookCount int `json:"hookCount"`
+}
+
+// HooksListingHook is one row of the /hooks listing. Every display string has
+// control characters revealed; escape again for the host's own surface.
+type HooksListingHook struct {
+	Event string `json:"event"`
+	// Matcher is the matcher with control characters revealed; empty when the
+	// entry has none.
+	Matcher string `json:"matcher"`
+	// Source is the raw source name (userSettings, sessionHook, pluginHook, …).
+	Source string `json:"source"`
+	// SourceLabel is the user-facing source description.
+	SourceLabel string `json:"sourceLabel"`
+	PluginName  string `json:"pluginName,omitempty"`
+	// Type is the hook type (command, prompt, agent, http, mcp_tool, …).
+	Type string `json:"type"`
+	// DisplayText is the list-row label: StatusMessage when set, else the
+	// identity text; one line, control characters revealed.
+	DisplayText string `json:"displayText"`
+	// CommandText is the identity text — the literal command/prompt/URL that
+	// runs, control characters revealed.
+	CommandText string `json:"commandText"`
+	// ContentLabel labels CommandText (Command, Prompt, URL, …).
+	ContentLabel string `json:"contentLabel"`
+	// Condition is the if-condition, revealed, when set.
+	Condition        string `json:"condition,omitempty"`
+	Timeout          int    `json:"timeout,omitempty"`
+	StatusMessage    string `json:"statusMessage,omitempty"`
+	RunsOnce         bool   `json:"runsOnce,omitempty"`
+	RunsInBackground bool   `json:"runsInBackground,omitempty"`
+	// Disabled is true when the session's mode or policy keeps this hook from
+	// running (Policy and SafeMode/BareMode say why); absent on rows that run.
+	Disabled bool `json:"disabled,omitempty"`
+	// Editable carries the entry as stored — for a host's edit form and as the
+	// target it names to `claude edit-hook`. Present only on rows from a
+	// settings file this session reads and may write.
+	Editable *HooksListingEditable `json:"editable,omitempty"`
+}
+
+// HooksListingEditable is a hook entry as stored, with no display escaping —
+// the raw matcher and hook object a host edit form round-trips.
+type HooksListingEditable struct {
+	// Matcher is the raw matcher, empty when the entry has none.
+	Matcher string `json:"matcher"`
+	// Config is the raw stored hook object.
+	Config map[string]any `json:"config"`
+	// HeadersRedacted is true when HTTP header values were blanked; a replace
+	// that sends no headers keeps the stored ones.
+	HeadersRedacted bool `json:"headersRedacted,omitempty"`
+}
+
+// HooksListingEventCatalogEntry is one hook event in an add-hook form.
+type HooksListingEventCatalogEntry struct {
+	Name            string `json:"name"`
+	Summary         string `json:"summary"`
+	SupportsMatcher bool   `json:"supportsMatcher"`
+}
+
+// HooksListingPolicy is the managed-settings state the /hooks menu banners on.
+type HooksListingPolicy struct {
+	// DisabledByPolicy is managed disableAllHooks — nothing runs at all.
+	DisabledByPolicy bool `json:"disabledByPolicy"`
+	// ManagedOnly is managed allowManagedHooksOnly — non-managed hooks are
+	// blocked and managed hooks are intentionally not listed.
+	ManagedOnly bool `json:"managedOnly"`
+	// PluginOnly is managed strictPluginOnlyCustomization locking the surface.
+	PluginOnly bool `json:"pluginOnly"`
+	// AllDisabled is the effective disableAllHooks, whatever source set it.
+	AllDisabled bool `json:"allDisabled"`
+	// PolicyHookCount is hooks configured in managed settings — they run even
+	// under a non-managed disableAllHooks.
+	PolicyHookCount int `json:"policyHookCount"`
+	// PolicyUnreadable is set when a managed settings source exists but could
+	// not be read: what the organization configured is unknown, so edit_hook
+	// refuses every edit (fail-closed) and a host locks its editing controls.
+	// The wire only ever carries true, so absence means readable (sdk.d.ts
+	// v0.3.278 L3957).
+	PolicyUnreadable bool `json:"policyUnreadable,omitempty"`
+}
+
+// HooksListingSafeMode describes the session's --safe-mode state.
+type HooksListingSafeMode struct {
+	ManagedHooksStillApply bool `json:"managedHooksStillApply"`
+	// ExitHint is how to leave safe mode, per its activation source.
+	ExitHint string `json:"exitHint"`
+}
+
+// HooksListingBareMode describes the session's --bare / CLAUDE_CODE_SIMPLE
+// state.
+type HooksListingBareMode struct {
+	// ExitHint is how to leave bare mode, per its activation source.
+	ExitHint string `json:"exitHint"`
 }

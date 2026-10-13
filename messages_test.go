@@ -109,7 +109,9 @@ func TestAgentDefinitionJSON(t *testing.T) {
 		Skills:                             []string{"go"},
 		InitialPrompt:                      "Start here",
 		MaxTurns:                           5,
+		AutoCompactWindow:                  60000,
 		Background:                         &background,
+		OmitClaudeMd:                       true,
 		Memory:                             AgentMemoryProject,
 		Effort:                             AgentEffort{Numeric: &effortBudget},
 		PermissionMode:                     PermissionModeAcceptEdits,
@@ -135,7 +137,9 @@ func TestAgentDefinitionJSON(t *testing.T) {
 	assert.Equal(t, []interface{}{"go"}, got["skills"])
 	assert.Equal(t, "Start here", got["initialPrompt"])
 	assert.Equal(t, float64(5), got["maxTurns"])
+	assert.Equal(t, float64(60000), got["autoCompactWindow"])
 	assert.Equal(t, false, got["background"])
+	assert.Equal(t, true, got["omitClaudeMd"])
 	assert.Equal(t, "project", got["memory"])
 	assert.Equal(t, float64(30000), got["effort"])
 	assert.Equal(t, "acceptEdits", got["permissionMode"])
@@ -155,8 +159,10 @@ func TestAgentDefinitionJSON(t *testing.T) {
 	assert.Equal(t, agent.Skills, decoded.Skills)
 	assert.Equal(t, agent.InitialPrompt, decoded.InitialPrompt)
 	assert.Equal(t, agent.MaxTurns, decoded.MaxTurns)
+	assert.Equal(t, agent.AutoCompactWindow, decoded.AutoCompactWindow)
 	require.NotNil(t, decoded.Background)
 	assert.Equal(t, false, *decoded.Background)
+	assert.True(t, decoded.OmitClaudeMd)
 	assert.Equal(t, agent.Memory, decoded.Memory)
 	require.NotNil(t, decoded.Effort.Numeric)
 	assert.Equal(t, effortBudget, *decoded.Effort.Numeric)
@@ -177,7 +183,7 @@ func TestAgentDefinitionJSONOmitUnset(t *testing.T) {
 
 	assert.Equal(t, "Reviews changes", got["description"])
 	assert.Equal(t, "Review carefully", got["prompt"])
-	for _, key := range []string{"memory", "effort", "maxTurns", "background", "observer", "observerMessage"} {
+	for _, key := range []string{"memory", "effort", "maxTurns", "background", "omitClaudeMd", "observer", "observerMessage"} {
 		assert.NotContains(t, got, key)
 	}
 }
@@ -431,6 +437,31 @@ func TestParseMessageAssistantMessage(t *testing.T) {
 	assert.Equal(t, 50, assistantMsg.Usage.OutputTokens)
 	assert.Equal(t, 150, assistantMsg.Usage.TotalTokens)
 	assert.Equal(t, 0.0025, assistantMsg.Usage.Cost)
+}
+
+func TestMessageAgentID(t *testing.T) {
+	msg, err := ParseMessage([]byte(`{"type":"assistant","agent_id":"a1",` +
+		`"message":{"role":"assistant","content":[]},` +
+		`"parent_tool_use_id":"tu","uuid":"u","session_id":"s"}`))
+	require.NoError(t, err)
+	assistant, ok := msg.(AssistantMessage)
+	require.True(t, ok)
+	assert.Equal(t, "a1", assistant.AgentID)
+
+	msg, err = ParseMessage([]byte(`{"type":"user","agent_id":"a1",` +
+		`"message":{"role":"user","content":[{"type":"text","text":"hi"}]},` +
+		`"parent_tool_use_id":"tu","session_id":"s"}`))
+	require.NoError(t, err)
+	user, ok := msg.(UserMessage)
+	require.True(t, ok)
+	assert.Equal(t, "a1", user.AgentID)
+
+	// Main-thread messages carry no agent_id and must not grow one.
+	for _, v := range []interface{}{AssistantMessage{}, UserMessage{}} {
+		data, err := json.Marshal(v)
+		require.NoError(t, err)
+		assert.NotContains(t, string(data), `"agent_id"`, "%T", v)
+	}
 }
 
 func TestParseMessageAssistantMessageSubagentFields(t *testing.T) {
@@ -1362,6 +1393,8 @@ func TestRateLimitEventMessageRoundTripAndParse(t *testing.T) {
 			"isUsingOverage",
 			"overageInUse",
 			"surpassedThreshold",
+			"overageEnabled",
+			"limitScope",
 		} {
 			assert.NotContains(t, info, key)
 		}
@@ -1386,6 +1419,7 @@ func TestRateLimitEventMessageRoundTripAndParse(t *testing.T) {
 				OverageDisabledReason: rateLimitOverageDisabledReasonPtr(RateLimitOverageDisabledReasonOutOfCredits),
 				IsUsingOverage:        boolPtr(true),
 				OverageInUse:          boolPtr(true),
+				OverageEnabled:        boolPtr(true),
 				SurpassedThreshold:    float64Ptr(0.8),
 			},
 			UUID:      "550e8400-e29b-41d4-a716-446655440033",
@@ -1406,6 +1440,7 @@ func TestRateLimitEventMessageRoundTripAndParse(t *testing.T) {
 				"overageDisabledReason": "out_of_credits",
 				"isUsingOverage": true,
 				"overageInUse": true,
+				"overageEnabled": true,
 				"surpassedThreshold": 0.8
 			},
 			"uuid": "550e8400-e29b-41d4-a716-446655440033",
@@ -2483,6 +2518,47 @@ func TestParseMessageSystemInitCapabilities(t *testing.T) {
 	assert.Equal(t, []string{"interrupt_receipt_v1", "some_future_cap"}, systemMsg.Capabilities)
 }
 
+func TestParseMessageSystemInitPluginErrors(t *testing.T) {
+	input := `{
+		"type": "system",
+		"subtype": "init",
+		"uuid": "550e8400-e29b-41d4-a716-446655440701",
+		"session_id": "sess_plugins_001",
+		"apiKeySource": "env",
+		"cwd": "/workspace/project",
+		"tools": [],
+		"mcp_servers": [],
+		"model": "claude-opus-4-8",
+		"permissionMode": "default",
+		"slash_commands": [],
+		"output_style": "default",
+		"plugins": [{"name": "lint", "path": "/plugins/lint", "version": "1.2.0"}],
+		"plugin_errors": [
+			{"plugin": "inline[1]", "type": "path-not-found",
+			 "message": "no such directory", "path": "/workspace/project/missing"},
+			{"plugin": "lint@local", "type": "hook-load-failed",
+			 "message": "hooks.json is not valid JSON"}
+		]
+	}`
+
+	msg, err := ParseMessage([]byte(input))
+	require.NoError(t, err)
+
+	init := msg.(SystemMessage)
+	require.Len(t, init.Plugins, 1)
+	assert.Equal(t, "1.2.0", init.Plugins[0].Version)
+
+	require.Len(t, init.PluginErrors, 2)
+	assert.Equal(t, SystemPluginError{
+		Plugin:  "inline[1]",
+		Type:    "path-not-found",
+		Message: "no such directory",
+		Path:    "/workspace/project/missing",
+	}, init.PluginErrors[0])
+	assert.Empty(t, init.PluginErrors[1].Path,
+		"a plugin that loaded with a broken component carries no path")
+}
+
 func TestParseMessageCompactBoundary(t *testing.T) {
 	input := `{
 		"type": "system",
@@ -2987,6 +3063,120 @@ func TestParseMessageTaskStartedSubagentType(t *testing.T) {
 	assert.Equal(t, "reviewer", taskMsg.SubagentType)
 }
 
+// TestParseMessageTaskRunIDs covers run_id on every task_* event, the
+// parent_task_id on task_started, and the three new background_tasks_changed
+// entry fields (sdk.d.ts v0.3.296).
+func TestParseMessageTaskRunIDs(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		check func(t *testing.T, msg Message)
+	}{
+		{
+			name: "task_started",
+			input: `{"type":"system","subtype":"task_started","task_id":"t1",` +
+				`"run_id":"r1","parent_task_id":"t0","description":"d",` +
+				`"uuid":"u","session_id":"s"}`,
+			check: func(t *testing.T, msg Message) {
+				m, ok := msg.(TaskStartedMessage)
+				require.True(t, ok)
+				assert.Equal(t, "r1", m.RunID)
+				assert.Equal(t, "t0", m.ParentTaskID)
+			},
+		},
+		{
+			name: "task_progress",
+			input: `{"type":"system","subtype":"task_progress","task_id":"t1",` +
+				`"run_id":"r1","description":"d","usage":{},` +
+				`"uuid":"u","session_id":"s"}`,
+			check: func(t *testing.T, msg Message) {
+				m, ok := msg.(TaskProgressMessage)
+				require.True(t, ok)
+				assert.Equal(t, "r1", m.RunID)
+			},
+		},
+		{
+			name: "task_updated",
+			input: `{"type":"system","subtype":"task_updated","task_id":"t1",` +
+				`"run_id":"r1","patch":{},"uuid":"u","session_id":"s"}`,
+			check: func(t *testing.T, msg Message) {
+				m, ok := msg.(TaskUpdatedMessage)
+				require.True(t, ok)
+				assert.Equal(t, "r1", m.RunID)
+			},
+		},
+		{
+			name: "task_notification",
+			input: `{"type":"system","subtype":"task_notification",` +
+				`"task_id":"t1","run_id":"r1","status":"completed",` +
+				`"output_file":"","summary":"","uuid":"u","session_id":"s"}`,
+			check: func(t *testing.T, msg Message) {
+				m, ok := msg.(TaskNotificationMessage)
+				require.True(t, ok)
+				assert.Equal(t, "r1", m.RunID)
+			},
+		},
+		{
+			name: "background_tasks_changed",
+			input: `{"type":"system","subtype":"background_tasks_changed",` +
+				`"tasks":[{"task_id":"t1","run_id":"r1",` +
+				`"task_type":"local_agent","subagent_type":"general-purpose",` +
+				`"description":"d","parent_task_id":"t0"}],` +
+				`"uuid":"u","session_id":"s"}`,
+			check: func(t *testing.T, msg Message) {
+				m, ok := msg.(BackgroundTasksChangedMessage)
+				require.True(t, ok)
+				require.Len(t, m.Tasks, 1)
+				assert.Equal(t, BackgroundTask{
+					TaskID:       "t1",
+					RunID:        "r1",
+					TaskType:     "local_agent",
+					SubagentType: "general-purpose",
+					Description:  "d",
+					ParentTaskID: "t0",
+				}, m.Tasks[0])
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			msg, err := ParseMessage([]byte(tc.input))
+			require.NoError(t, err)
+			tc.check(t, msg)
+		})
+	}
+}
+
+// TestTaskRunIDsOmitEmpty pins that older-CLI frames re-marshal without the
+// new keys.
+func TestTaskRunIDsOmitEmpty(t *testing.T) {
+	for _, v := range []interface{}{
+		TaskStartedMessage{}, TaskProgressMessage{}, TaskUpdatedMessage{},
+		TaskNotificationMessage{}, BackgroundTask{}, MessageOrigin{},
+	} {
+		data, err := json.Marshal(v)
+		require.NoError(t, err)
+		for _, key := range []string{
+			`"run_id"`, `"runId"`, `"parent_task_id"`, `"subagent_type"`,
+		} {
+			assert.NotContains(t, string(data), key, "%T", v)
+		}
+	}
+}
+
+func TestMessageOriginRunIDRoundTrip(t *testing.T) {
+	var origin MessageOrigin
+	require.NoError(t, json.Unmarshal(
+		[]byte(`{"kind":"task-notification","runId":"r1"}`), &origin,
+	))
+	assert.Equal(t, "r1", origin.RunID)
+
+	data, err := json.Marshal(origin)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"kind":"task-notification","runId":"r1"}`, string(data))
+}
+
 func TestTaskStartedSubagentTypeOmitEmpty(t *testing.T) {
 	msg := TaskStartedMessage{
 		Type:        "system",
@@ -3282,6 +3472,58 @@ func TestParseMessageTaskUpdatedPausedStatus(t *testing.T) {
 	assert.Equal(t, TaskRunStatusPaused, taskMsg.Patch.Status)
 }
 
+func TestUserMessagePastedContent(t *testing.T) {
+	t.Run("submit path emits the union", func(t *testing.T) {
+		msg := UserMessage{
+			Type: "user",
+			Message: APIUserMessage{
+				Role:    "user",
+				Content: []UserContentBlock{{Type: "text", Text: "explain this"}},
+			},
+			PastedContent: []PastedContentEntry{
+				{Text: "line one\nline two"},
+				{Blocks: []UserContentBlock{{Type: "text", Text: "block text"}}},
+			},
+		}
+
+		data, err := json.Marshal(msg)
+		require.NoError(t, err)
+
+		var got map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(data, &got))
+		require.Contains(t, got, "pasted_content")
+		// First entry is a bare string, second is an array of blocks.
+		assert.JSONEq(t,
+			`["line one\nline two",[{"type":"text","text":"block text"}]]`,
+			string(got["pasted_content"]))
+	})
+
+	t.Run("omitted when empty", func(t *testing.T) {
+		data, err := json.Marshal(UserMessage{Type: "user"})
+		require.NoError(t, err)
+		var got map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(data, &got))
+		assert.NotContains(t, got, "pasted_content")
+	})
+
+	t.Run("unmarshal accepts both forms", func(t *testing.T) {
+		var got UserMessage
+		require.NoError(t, json.Unmarshal([]byte(`{
+			"type": "user",
+			"message": {"role": "user", "content": []},
+			"parent_tool_use_id": null,
+			"pasted_content": ["typed paste", [{"type": "text", "text": "b"}]]
+		}`), &got))
+
+		require.Len(t, got.PastedContent, 2)
+		assert.Equal(t, "typed paste", got.PastedContent[0].Text)
+		assert.Nil(t, got.PastedContent[0].Blocks)
+		assert.Empty(t, got.PastedContent[1].Text)
+		require.Len(t, got.PastedContent[1].Blocks, 1)
+		assert.Equal(t, "b", got.PastedContent[1].Blocks[0].Text)
+	})
+}
+
 func TestParseMessageTaskNotification(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -3412,6 +3654,27 @@ func TestParseMessageTaskNotification(t *testing.T) {
 				assert.Empty(t, taskMsg.ToolUseID)
 				assert.Nil(t, taskMsg.Usage)
 				assert.Nil(t, taskMsg.SkipTranscript)
+				// An ordinary stop carries no machine-readable reason.
+				assert.Empty(t, taskMsg.Reason)
+			},
+		},
+		{
+			name: "stopped by worker restart",
+			input: `{
+				"type": "system",
+				"subtype": "task_notification",
+				"task_id": "task_01J8Z8Y2X3K4M5N6P7Q8R9S0TL",
+				"status": "stopped",
+				"reason": "worker_restart",
+				"output_file": "/tmp/claude-task-output-orphaned.md",
+				"summary": "Task orphaned by a worker restart",
+				"uuid": "550e8400-e29b-41d4-a716-446655440022",
+				"session_id": "sess_task_123"
+			}`,
+			wantStatus: TaskNotificationStatusStopped,
+			check: func(t *testing.T, taskMsg TaskNotificationMessage) {
+				t.Helper()
+				assert.Equal(t, TaskEndReasonWorkerRestart, taskMsg.Reason)
 			},
 		},
 	}
@@ -4243,6 +4506,37 @@ func TestParseMessageConversationReset(t *testing.T) {
 	assert.Equal(t, "conversation_reset", reset.MessageType())
 	assert.Equal(t, "conv_9f00", reset.NewConversationID)
 	assert.Equal(t, "sess_reset_001", reset.SessionID)
+}
+
+func TestParseMessageConversationResetTrigger(t *testing.T) {
+	msg, err := ParseMessage([]byte(`{
+		"type": "conversation_reset",
+		"new_conversation_id": "conv_9f01",
+		"uuid": "550e8400-e29b-41d4-a716-446655440601",
+		"session_id": "sess_reset_002",
+		"trigger": "clear",
+		"user_message_uuid": "550e8400-e29b-41d4-a716-446655440602",
+		"timestamp": "2026-10-05T18:15:52.814Z"
+	}`))
+	require.NoError(t, err)
+
+	reset := msg.(ConversationResetMessage)
+	assert.Equal(t, ConversationResetTriggerClear, reset.Trigger)
+	assert.Equal(t, "550e8400-e29b-41d4-a716-446655440602", reset.UserMessageUUID)
+	assert.Equal(t, "2026-10-05T18:15:52.814Z", reset.Timestamp)
+
+	// An unknown trigger from a newer CLI must still decode.
+	msg, err = ParseMessage([]byte(`{
+		"type": "conversation_reset",
+		"new_conversation_id": "conv_9f02",
+		"uuid": "550e8400-e29b-41d4-a716-446655440603",
+		"session_id": "sess_reset_002",
+		"trigger": "some_future_flow"
+	}`))
+	require.NoError(t, err)
+	reset = msg.(ConversationResetMessage)
+	assert.Equal(t, ConversationResetTrigger("some_future_flow"), reset.Trigger)
+	assert.Empty(t, reset.UserMessageUUID)
 }
 
 func TestParseMessageActiveGoal(t *testing.T) {
@@ -5431,5 +5725,928 @@ func TestParseMessageUserMessageUUIDs(t *testing.T) {
 		require.True(t, ok)
 		assert.Equal(t, "u-2", rm.UserMessageUUID)
 		assert.Nil(t, rm.UserMessageUUIDs, "fall back to the singular field")
+	})
+}
+
+// TestParseMessageResumeReason covers the v0.3.270 resume_reason sibling,
+// which rides the same frames as user_message_uuid on the automatic re-run of
+// a turn a worker restart interrupted.
+func TestParseMessageResumeReason(t *testing.T) {
+	t.Run("assistant carries the host's own reason", func(t *testing.T) {
+		input := `{
+			"type": "assistant",
+			"message": {"role":"assistant","content":[{"type":"text","text":"hi"}]},
+			"user_message_uuid": "u-interrupted",
+			"resume_reason": "host_draining",
+			"uuid": "550e8400-e29b-41d4-a716-446655440501",
+			"session_id": "sess_resume"
+		}`
+		msg, err := ParseMessage([]byte(input))
+		require.NoError(t, err)
+		am, ok := msg.(AssistantMessage)
+		require.True(t, ok)
+		assert.Equal(t, ResumeReasonHostDraining, am.ResumeReason)
+		assert.Equal(t, "u-interrupted", am.UserMessageUUID,
+			"the re-run names the interrupted turn's own last user prompt")
+	})
+
+	t.Run("stream event carries it too", func(t *testing.T) {
+		input := `{
+			"type": "stream_event",
+			"event": {"type":"text_delta","delta":"hi"},
+			"resume_reason": "container_recreated",
+			"uuid": "550e8400-e29b-41d4-a716-446655440502",
+			"session_id": "sess_resume"
+		}`
+		msg, err := ParseMessage([]byte(input))
+		require.NoError(t, err)
+		pm, ok := msg.(PartialAssistantMessage)
+		require.True(t, ok)
+		assert.Equal(t, ResumeReasonContainerRecreated, pm.ResumeReason)
+	})
+
+	t.Run("result falls back to interrupted_turn without an echo", func(t *testing.T) {
+		input := `{
+			"type": "result",
+			"subtype": "success",
+			"result": "done",
+			"resume_reason": "interrupted_turn",
+			"uuid": "550e8400-e29b-41d4-a716-446655440503",
+			"session_id": "sess_resume"
+		}`
+		msg, err := ParseMessage([]byte(input))
+		require.NoError(t, err)
+		rm, ok := msg.(ResultMessage)
+		require.True(t, ok)
+		assert.Equal(t, ResumeReasonInterruptedTurn, rm.ResumeReason)
+		assert.Empty(t, rm.UserMessageUUID,
+			"a re-run whose opener could not be vouched still carries the reason")
+	})
+
+	t.Run("error result carries it", func(t *testing.T) {
+		input := `{
+			"type": "result",
+			"subtype": "error_during_execution",
+			"is_error": true,
+			"resume_reason": "checkpoint_restore",
+			"uuid": "550e8400-e29b-41d4-a716-446655440504",
+			"session_id": "sess_resume"
+		}`
+		msg, err := ParseMessage([]byte(input))
+		require.NoError(t, err)
+		rm, ok := msg.(ResultMessage)
+		require.True(t, ok)
+		assert.Equal(t, ResumeReasonCheckpointRestore, rm.ResumeReason)
+	})
+
+	t.Run("an ordinary turn leaves it empty", func(t *testing.T) {
+		input := `{
+			"type": "result",
+			"subtype": "success",
+			"result": "done",
+			"uuid": "550e8400-e29b-41d4-a716-446655440505",
+			"session_id": "sess_resume"
+		}`
+		msg, err := ParseMessage([]byte(input))
+		require.NoError(t, err)
+		rm, ok := msg.(ResultMessage)
+		require.True(t, ok)
+		assert.Empty(t, rm.ResumeReason)
+	})
+}
+
+// TestParseMessageResultIndex covers the v0.3.270 result_index delivery
+// sequence and the local_command sibling, both on the result frame.
+func TestParseMessageResultIndex(t *testing.T) {
+	t.Run("index zero is a real value", func(t *testing.T) {
+		input := `{
+			"type": "result",
+			"subtype": "success",
+			"result": "done",
+			"result_index": 0,
+			"uuid": "550e8400-e29b-41d4-a716-446655440601",
+			"session_id": "sess_index"
+		}`
+		msg, err := ParseMessage([]byte(input))
+		require.NoError(t, err)
+		rm, ok := msg.(ResultMessage)
+		require.True(t, ok)
+		require.NotNil(t, rm.ResultIndex, "zero must survive as a value, not collapse to absent")
+		assert.Equal(t, 0, *rm.ResultIndex)
+	})
+
+	t.Run("a gap means a result was lost", func(t *testing.T) {
+		input := `{
+			"type": "result",
+			"subtype": "success",
+			"result": "done",
+			"num_turns": 1,
+			"result_index": 4,
+			"uuid": "550e8400-e29b-41d4-a716-446655440602",
+			"session_id": "sess_index"
+		}`
+		msg, err := ParseMessage([]byte(input))
+		require.NoError(t, err)
+		rm, ok := msg.(ResultMessage)
+		require.True(t, ok)
+		require.NotNil(t, rm.ResultIndex)
+		assert.Equal(t, 4, *rm.ResultIndex)
+		assert.Equal(t, 1, rm.NumTurns,
+			"result_index counts results in the run, num_turns model round-trips in the turn")
+	})
+
+	t.Run("error result carries it too", func(t *testing.T) {
+		input := `{
+			"type": "result",
+			"subtype": "error_during_execution",
+			"is_error": true,
+			"result_index": 2,
+			"uuid": "550e8400-e29b-41d4-a716-446655440603",
+			"session_id": "sess_index"
+		}`
+		msg, err := ParseMessage([]byte(input))
+		require.NoError(t, err)
+		rm, ok := msg.(ResultMessage)
+		require.True(t, ok)
+		require.NotNil(t, rm.ResultIndex)
+		assert.Equal(t, 2, *rm.ResultIndex)
+	})
+
+	t.Run("local_command rides a success result", func(t *testing.T) {
+		input := `{
+			"type": "result",
+			"subtype": "success",
+			"result": "done",
+			"local_command": "/context",
+			"uuid": "550e8400-e29b-41d4-a716-446655440604",
+			"session_id": "sess_index"
+		}`
+		msg, err := ParseMessage([]byte(input))
+		require.NoError(t, err)
+		rm, ok := msg.(ResultMessage)
+		require.True(t, ok)
+		assert.Equal(t, "/context", rm.LocalCommand)
+	})
+
+	t.Run("older producer omits both", func(t *testing.T) {
+		input := `{
+			"type": "result",
+			"subtype": "success",
+			"result": "done",
+			"uuid": "550e8400-e29b-41d4-a716-446655440605",
+			"session_id": "sess_index"
+		}`
+		msg, err := ParseMessage([]byte(input))
+		require.NoError(t, err)
+		rm, ok := msg.(ResultMessage)
+		require.True(t, ok)
+		assert.Nil(t, rm.ResultIndex, "absent is not index zero")
+		assert.Empty(t, rm.LocalCommand)
+	})
+}
+
+// TestRateLimitInfoLimitScope covers the v0.3.270 limitScope field, which
+// distinguishes a pooled-group-budget denial from the member exhausting their
+// own cap — the two are otherwise identical on the wire.
+func TestRateLimitInfoLimitScope(t *testing.T) {
+	t.Run("group pool denial", func(t *testing.T) {
+		input := `{
+			"type": "rate_limit_event",
+			"rate_limit_info": {
+				"status": "rejected",
+				"limitScope": "group_pool",
+				"errorCode": "credits_required"
+			},
+			"uuid": "550e8400-e29b-41d4-a716-446655440701",
+			"session_id": "sess_scope"
+		}`
+		msg, err := ParseMessage([]byte(input))
+		require.NoError(t, err)
+		rl, ok := msg.(RateLimitEventMessage)
+		require.True(t, ok)
+		assert.Equal(t, RateLimitScopeGroupPool, rl.RateLimitInfo.LimitScope)
+		assert.Equal(t, RateLimitErrorCodeCreditsRequired, rl.RateLimitInfo.ErrorCode)
+	})
+
+	t.Run("service and channel scopes", func(t *testing.T) {
+		for _, want := range []RateLimitScope{
+			RateLimitScopeService, RateLimitScopeChannel,
+		} {
+			input := `{
+				"type": "rate_limit_event",
+				"rate_limit_info": {"status": "rejected", "limitScope": "` +
+				string(want) + `"},
+				"uuid": "550e8400-e29b-41d4-a716-446655440702",
+				"session_id": "sess_scope"
+			}`
+			msg, err := ParseMessage([]byte(input))
+			require.NoError(t, err)
+			rl, ok := msg.(RateLimitEventMessage)
+			require.True(t, ok)
+			assert.Equal(t, want, rl.RateLimitInfo.LimitScope)
+		}
+	})
+
+	t.Run("plain member denial leaves it empty", func(t *testing.T) {
+		input := `{
+			"type": "rate_limit_event",
+			"rate_limit_info": {"status": "rejected"},
+			"uuid": "550e8400-e29b-41d4-a716-446655440703",
+			"session_id": "sess_scope"
+		}`
+		msg, err := ParseMessage([]byte(input))
+		require.NoError(t, err)
+		rl, ok := msg.(RateLimitEventMessage)
+		require.True(t, ok)
+		assert.Empty(t, rl.RateLimitInfo.LimitScope)
+	})
+}
+
+// TestAssistantMessageErrorCodes pins the v0.3.270 additions to the assistant
+// error union.
+func TestAssistantMessageErrorCodes(t *testing.T) {
+	for _, tc := range []struct {
+		wire string
+		want AssistantMessageError
+	}{
+		{"verification_required", AssistantMessageErrorVerificationRequired},
+		{"cloud_credential_error", AssistantMessageErrorCloudCredentialError},
+	} {
+		t.Run(tc.wire, func(t *testing.T) {
+			input := `{
+				"type": "assistant",
+				"message": {"role":"assistant","content":[]},
+				"error": "` + tc.wire + `",
+				"uuid": "550e8400-e29b-41d4-a716-446655440704",
+				"session_id": "sess_err"
+			}`
+			msg, err := ParseMessage([]byte(input))
+			require.NoError(t, err)
+			am, ok := msg.(AssistantMessage)
+			require.True(t, ok)
+			assert.Equal(t, tc.want, am.Error)
+		})
+	}
+}
+
+// TestSystemMessageMCPServerSource covers the source field v0.3.278 adds to
+// the init system message's MCP rows (sdk.d.ts L5599).
+func TestSystemMessageMCPServerSource(t *testing.T) {
+	raw := []byte(`{
+		"type": "system",
+		"subtype": "init",
+		"session_id": "sess_1",
+		"uuid": "11111111-1111-1111-1111-111111111111",
+		"model": "claude-opus-4-8",
+		"tools": ["Bash"],
+		"mcp_servers": [
+			{"name": "calculator", "status": "connected", "source": "sdk"},
+			{"name": "acme", "status": "connected", "source": "project"},
+			{"name": "legacy", "status": "connected"}
+		]
+	}`)
+
+	msg, err := ParseMessage(raw)
+	require.NoError(t, err)
+
+	sys, ok := msg.(SystemMessage)
+	require.True(t, ok, "expected SystemMessage, got %T", msg)
+	require.Len(t, sys.MCPServers, 3)
+
+	assert.Equal(t, MCPServerSourceSDK, sys.MCPServers[0].Source)
+	assert.True(t, sys.MCPServers[0].IsSDK())
+
+	assert.Equal(t, MCPServerSourceProject, sys.MCPServers[1].Source)
+	assert.False(t, sys.MCPServers[1].IsSDK())
+
+	// Pre-v2.1.278 CLIs omit it. Unknown is not a license to assume SDK.
+	assert.Empty(t, sys.MCPServers[2].Source)
+	assert.False(t, sys.MCPServers[2].IsSDK())
+}
+
+// TestResultStartupFailureReason covers startup_failure_reason and the
+// StartupFailureReason enum added in TS SDK v0.3.278 (sdk.d.ts L5388, L5561).
+func TestResultStartupFailureReasonOrgConfig(t *testing.T) {
+	for _, reason := range []StartupFailureReason{
+		StartupFailureOrgConfigRequiredUnavailable,
+		StartupFailureOrgConfigRefused,
+	} {
+		raw := []byte(`{"type":"result","subtype":"error_during_execution",` +
+			`"session_id":"s","uuid":"u","is_error":true,` +
+			`"startup_failure_reason":"` + string(reason) + `",` +
+			`"duration_ms":0,"num_turns":0,"total_cost_usd":0}`)
+
+		msg, err := ParseMessage(raw)
+		require.NoError(t, err)
+		res, ok := msg.(ResultMessage)
+		require.True(t, ok)
+		assert.Equal(t, reason, res.StartupFailureReason)
+	}
+}
+
+func TestResultStartupFailureReason(t *testing.T) {
+	t.Run("parsed off the zeroed error result", func(t *testing.T) {
+		raw := []byte(`{
+			"type": "result",
+			"subtype": "error_during_execution",
+			"session_id": "sess_1",
+			"uuid": "11111111-1111-1111-1111-111111111111",
+			"is_error": true,
+			"errors": ["Claude Code requires a newer version."],
+			"startup_failure_reason": "cli_version_too_old",
+			"duration_ms": 0,
+			"num_turns": 0,
+			"total_cost_usd": 0
+		}`)
+
+		msg, err := ParseMessage(raw)
+		require.NoError(t, err)
+
+		res, ok := msg.(ResultMessage)
+		require.True(t, ok, "expected ResultMessage, got %T", msg)
+		assert.Equal(t, StartupFailureCLIVersionTooOld, res.StartupFailureReason)
+		// Errors carries the same text stderr got; it stays the fallback.
+		require.Len(t, res.Errors, 1)
+	})
+
+	// Empty means "no machine-readable cause", which covers an ordinary
+	// result, an unrecognized startup failure, and any producer older than
+	// v0.3.278. It never means the session started fine.
+	t.Run("absent on an ordinary result", func(t *testing.T) {
+		raw := []byte(`{
+			"type": "result",
+			"subtype": "success",
+			"session_id": "sess_1",
+			"uuid": "11111111-1111-1111-1111-111111111111",
+			"is_error": false,
+			"result": "done",
+			"duration_ms": 10,
+			"num_turns": 1,
+			"total_cost_usd": 0.01
+		}`)
+
+		msg, err := ParseMessage(raw)
+		require.NoError(t, err)
+
+		res, ok := msg.(ResultMessage)
+		require.True(t, ok)
+		assert.Empty(t, res.StartupFailureReason)
+	})
+
+	// Open set: a newer CLI may name a cause this SDK predates, and that must
+	// survive parsing rather than failing the whole result.
+	t.Run("unknown reason survives", func(t *testing.T) {
+		raw := []byte(`{
+			"type": "result",
+			"subtype": "error_during_execution",
+			"session_id": "sess_1",
+			"uuid": "11111111-1111-1111-1111-111111111111",
+			"is_error": true,
+			"errors": ["something new went wrong"],
+			"startup_failure_reason": "a_cause_from_a_newer_cli",
+			"duration_ms": 0,
+			"num_turns": 0,
+			"total_cost_usd": 0
+		}`)
+
+		msg, err := ParseMessage(raw)
+		require.NoError(t, err)
+
+		res, ok := msg.(ResultMessage)
+		require.True(t, ok)
+		assert.Equal(t, StartupFailureReason("a_cause_from_a_newer_cli"),
+			res.StartupFailureReason)
+		require.Len(t, res.Errors, 1)
+	})
+
+	// Every member of the TS union must round-trip, since a host switching on
+	// these needs the constant to equal the wire string exactly.
+	t.Run("all sixteen members round-trip", func(t *testing.T) {
+		all := []StartupFailureReason{
+			StartupFailureOrgPinAPIKeyConflict,
+			StartupFailureOrgVerifyFailed,
+			StartupFailureOrgPinMismatch,
+			StartupFailureManagedSettingsInvalid,
+			StartupFailureRemoteSettingsRequiredUnavailable,
+			StartupFailureGatewaySignInRequired,
+			StartupFailureGatewayAccessDenied,
+			StartupFailureProxyInvalid,
+			StartupFailureTempDirUnusable,
+			StartupFailureCwdUnavailable,
+			StartupFailureShellToolMissing,
+			StartupFailureSessionHeldByBackground,
+			StartupFailureWorktreeResumeRefused,
+			StartupFailureWorktreeUnverified,
+			StartupFailureCLIVersionTooOld,
+			StartupFailureBypassRoot,
+		}
+		require.Len(t, all, 16, "TS union has 16 members at sdk.d.ts L5561")
+
+		seen := make(map[StartupFailureReason]bool, len(all))
+		for _, reason := range all {
+			assert.NotEmpty(t, reason)
+			assert.False(t, seen[reason], "duplicate value %q", reason)
+			seen[reason] = true
+
+			raw := []byte(`{
+				"type": "result",
+				"subtype": "error_during_execution",
+				"session_id": "s",
+				"uuid": "11111111-1111-1111-1111-111111111111",
+				"is_error": true,
+				"startup_failure_reason": "` + string(reason) + `"
+			}`)
+
+			msg, err := ParseMessage(raw)
+			require.NoError(t, err)
+			res, ok := msg.(ResultMessage)
+			require.True(t, ok)
+			assert.Equal(t, reason, res.StartupFailureReason)
+		}
+	})
+}
+
+// TestAssistantUsageReport covers usage_report and the SDKUsageReport shape
+// added in TS SDK v0.3.278 (sdk.d.ts L3463, L5807).
+func TestAssistantUsageReport(t *testing.T) {
+	full := []byte(`{
+		"type": "assistant",
+		"session_id": "sess_1",
+		"uuid": "11111111-1111-1111-1111-111111111111",
+		"message": {
+			"id": "msg_1",
+			"type": "message",
+			"role": "assistant",
+			"model": "claude-opus-4-8",
+			"content": [{"type": "text", "text": "Current usage: ..."}],
+			"stop_reason": null,
+			"usage": {"input_tokens": 1, "output_tokens": 1}
+		},
+		"usage_report": {
+			"session": {
+				"total_cost_usd": 1.25,
+				"total_api_duration_ms": 4200,
+				"total_duration_ms": 9100,
+				"total_lines_added": 42,
+				"total_lines_removed": 7,
+				"model_usage": {
+					"claude-opus-4-8": {
+						"inputTokens": 100,
+						"outputTokens": 200,
+						"cacheReadInputTokens": 10,
+						"cacheCreationInputTokens": 5,
+						"webSearchRequests": 0
+					}
+				}
+			},
+			"rate_limits": {
+				"limits": [
+					{
+						"kind": "session",
+						"group": "session",
+						"percent": 12.5,
+						"resets_at": "2026-09-21T20:00:00Z",
+						"severity": "normal",
+						"is_active": true
+					},
+					{
+						"kind": "weekly_scoped",
+						"group": "weekly",
+						"percent": 88,
+						"resets_at": null,
+						"scope": {"model": {"display_name": "Opus"}},
+						"severity": "warning",
+						"is_active": false
+					}
+				],
+				"extra_usage": {
+					"is_enabled": true,
+					"monthly_limit": 5000,
+					"used_credits": 1234,
+					"utilization": 0.2468,
+					"currency": "USD"
+				}
+			}
+		}
+	}`)
+
+	t.Run("full report parses", func(t *testing.T) {
+		msg, err := ParseMessage(full)
+		require.NoError(t, err)
+
+		am, ok := msg.(AssistantMessage)
+		require.True(t, ok, "expected AssistantMessage, got %T", msg)
+		require.NotNil(t, am.UsageReport)
+
+		sess := am.UsageReport.Session
+		assert.InDelta(t, 1.25, sess.TotalCostUSD, 1e-9)
+		assert.Equal(t, int64(4200), sess.TotalAPIDurationMs)
+		assert.Equal(t, 42, sess.TotalLinesAdded)
+		require.Contains(t, sess.ModelUsage, "claude-opus-4-8")
+		assert.Equal(t, 200, sess.ModelUsage["claude-opus-4-8"].OutputTokens)
+
+		require.NotNil(t, am.UsageReport.RateLimits)
+		rows := am.UsageReport.RateLimits.Limits
+		require.Len(t, rows, 2)
+
+		assert.Equal(t, "session", rows[0].Kind)
+		assert.True(t, rows[0].IsActive)
+		require.NotNil(t, rows[0].ResetsAt)
+		assert.Equal(t, "2026-09-21T20:00:00Z", *rows[0].ResetsAt)
+		assert.Nil(t, rows[0].Scope)
+
+		assert.Equal(t, "weekly_scoped", rows[1].Kind)
+		assert.Equal(t, "warning", rows[1].Severity)
+		// A null reset time is distinct from an absent one; both mean the
+		// server gave no reset, and neither should read as a zero time.
+		assert.Nil(t, rows[1].ResetsAt)
+		require.NotNil(t, rows[1].Scope)
+		require.NotNil(t, rows[1].Scope.Model)
+		assert.Equal(t, "Opus", rows[1].Scope.Model.DisplayName)
+		assert.Nil(t, rows[1].Scope.Surface)
+
+		extra := am.UsageReport.RateLimits.ExtraUsage
+		require.NotNil(t, extra)
+		assert.True(t, extra.IsEnabled)
+		require.NotNil(t, extra.MonthlyLimit)
+		// Minor units: 5000 is $50.00, not $5000.
+		assert.Equal(t, int64(5000), *extra.MonthlyLimit)
+		require.NotNil(t, extra.Currency)
+		assert.Equal(t, "USD", *extra.Currency)
+	})
+
+	// The whole report is absent on ordinary assistant turns.
+	t.Run("absent on an ordinary turn", func(t *testing.T) {
+		raw := []byte(`{
+			"type": "assistant",
+			"session_id": "sess_1",
+			"uuid": "11111111-1111-1111-1111-111111111111",
+			"message": {
+				"id": "msg_1", "type": "message", "role": "assistant",
+				"model": "claude-opus-4-8",
+				"content": [{"type": "text", "text": "hi"}],
+				"stop_reason": null,
+				"usage": {"input_tokens": 1, "output_tokens": 1}
+			}
+		}`)
+
+		msg, err := ParseMessage(raw)
+		require.NoError(t, err)
+		am, ok := msg.(AssistantMessage)
+		require.True(t, ok)
+		assert.Nil(t, am.UsageReport)
+	})
+
+	// rate_limits is nullable on its own: the CLI could not fetch the plan
+	// rows, but the session totals are still real.
+	t.Run("null rate_limits keeps session totals", func(t *testing.T) {
+		raw := []byte(`{
+			"type": "assistant",
+			"session_id": "sess_1",
+			"uuid": "11111111-1111-1111-1111-111111111111",
+			"message": {
+				"id": "msg_1", "type": "message", "role": "assistant",
+				"model": "claude-opus-4-8",
+				"content": [{"type": "text", "text": "usage"}],
+				"stop_reason": null,
+				"usage": {"input_tokens": 1, "output_tokens": 1}
+			},
+			"usage_report": {
+				"session": {
+					"total_cost_usd": 0.5,
+					"total_api_duration_ms": 1,
+					"total_duration_ms": 2,
+					"total_lines_added": 0,
+					"total_lines_removed": 0,
+					"model_usage": {}
+				},
+				"rate_limits": null
+			}
+		}`)
+
+		msg, err := ParseMessage(raw)
+		require.NoError(t, err)
+		am, ok := msg.(AssistantMessage)
+		require.True(t, ok)
+		require.NotNil(t, am.UsageReport)
+		assert.Nil(t, am.UsageReport.RateLimits)
+		assert.InDelta(t, 0.5, am.UsageReport.Session.TotalCostUSD, 1e-9)
+	})
+
+	// limits has a three-way distinction the doc calls out: rows present,
+	// empty (server reported no meters), and null (body carried no rows).
+	t.Run("empty limits differs from null limits", func(t *testing.T) {
+		mk := func(limits string) *UsageReport {
+			raw := []byte(`{
+				"type": "assistant",
+				"session_id": "s",
+				"uuid": "11111111-1111-1111-1111-111111111111",
+				"message": {
+					"id": "m", "type": "message", "role": "assistant",
+					"model": "claude-opus-4-8",
+					"content": [], "stop_reason": null,
+					"usage": {"input_tokens": 1, "output_tokens": 1}
+				},
+				"usage_report": {
+					"session": {
+						"total_cost_usd": 0, "total_api_duration_ms": 0,
+						"total_duration_ms": 0, "total_lines_added": 0,
+						"total_lines_removed": 0, "model_usage": {}
+					},
+					"rate_limits": {"limits": ` + limits + `}
+				}
+			}`)
+			msg, err := ParseMessage(raw)
+			require.NoError(t, err)
+			am, ok := msg.(AssistantMessage)
+			require.True(t, ok)
+			require.NotNil(t, am.UsageReport)
+			return am.UsageReport
+		}
+
+		empty := mk(`[]`)
+		require.NotNil(t, empty.RateLimits)
+		assert.NotNil(t, empty.RateLimits.Limits)
+		assert.Empty(t, empty.RateLimits.Limits)
+
+		null := mk(`null`)
+		require.NotNil(t, null.RateLimits)
+		assert.Nil(t, null.RateLimits.Limits)
+	})
+
+	// An unknown meter kind must render rather than be dropped: the server
+	// owns the taxonomy and a new meter ships without an SDK release.
+	t.Run("unknown meter kind survives", func(t *testing.T) {
+		raw := []byte(`{
+			"type": "assistant",
+			"session_id": "s",
+			"uuid": "11111111-1111-1111-1111-111111111111",
+			"message": {
+				"id": "m", "type": "message", "role": "assistant",
+				"model": "claude-opus-4-8",
+				"content": [], "stop_reason": null,
+				"usage": {"input_tokens": 1, "output_tokens": 1}
+			},
+			"usage_report": {
+				"session": {
+					"total_cost_usd": 0, "total_api_duration_ms": 0,
+					"total_duration_ms": 0, "total_lines_added": 0,
+					"total_lines_removed": 0, "model_usage": {}
+				},
+				"rate_limits": {
+					"limits": [{
+						"kind": "monthly_org_pool",
+						"group": "monthly",
+						"percent": 3,
+						"resets_at": null,
+						"severity": "informational",
+						"is_active": false
+					}]
+				}
+			}
+		}`)
+
+		msg, err := ParseMessage(raw)
+		require.NoError(t, err)
+		am, ok := msg.(AssistantMessage)
+		require.True(t, ok)
+		require.NotNil(t, am.UsageReport)
+		require.NotNil(t, am.UsageReport.RateLimits)
+		require.Len(t, am.UsageReport.RateLimits.Limits, 1)
+		assert.Equal(t, "monthly_org_pool", am.UsageReport.RateLimits.Limits[0].Kind)
+		assert.Equal(t, "informational", am.UsageReport.RateLimits.Limits[0].Severity)
+	})
+}
+
+// TestResultFirstPostTimings covers the four first-post timing fields added in
+// TS SDK v0.3.278 (sdk.d.ts L5434, L5435, L5440, L5441).
+func TestResultFirstPostTimings(t *testing.T) {
+	t.Run("all four parse", func(t *testing.T) {
+		raw := []byte(`{
+			"type": "result",
+			"subtype": "success",
+			"session_id": "sess_1",
+			"uuid": "11111111-1111-1111-1111-111111111111",
+			"is_error": false,
+			"result": "done",
+			"time_origin_ms": 1700000000000,
+			"first_stream_post_ms": 120,
+			"first_stream_post_queue_wait_ms": 45,
+			"first_stream_post_queued_behind": "retry_backoff",
+			"first_stream_post_wall_ms": 1700000000120,
+			"first_text_post_ms": 180,
+			"first_text_post_wall_ms": 1700000000180,
+			"num_turns": 1,
+			"total_cost_usd": 0.01
+		}`)
+
+		msg, err := ParseMessage(raw)
+		require.NoError(t, err)
+		res, ok := msg.(ResultMessage)
+		require.True(t, ok, "expected ResultMessage, got %T", msg)
+
+		require.NotNil(t, res.FirstStreamPostQueueWaitMs)
+		assert.Equal(t, int64(45), *res.FirstStreamPostQueueWaitMs)
+		assert.Equal(t, FirstPostQueuedBehindRetryBackoff,
+			res.FirstStreamPostQueuedBehind)
+
+		require.NotNil(t, res.FirstTextPostMs)
+		assert.Equal(t, int64(180), *res.FirstTextPostMs)
+		require.NotNil(t, res.FirstTextPostWallMs)
+		assert.Equal(t, int64(1700000000180), *res.FirstTextPostWallMs)
+
+		// The first text post trails the first stream post when the stream
+		// opened with something other than text.
+		require.NotNil(t, res.FirstStreamPostMs)
+		assert.Greater(t, *res.FirstTextPostMs, *res.FirstStreamPostMs)
+	})
+
+	// A zero wait is real data, so it must survive as a present zero rather
+	// than collapsing into the absent case.
+	t.Run("zero queue wait is present, not absent", func(t *testing.T) {
+		raw := []byte(`{
+			"type": "result",
+			"subtype": "success",
+			"session_id": "s",
+			"uuid": "11111111-1111-1111-1111-111111111111",
+			"is_error": false,
+			"first_stream_post_queue_wait_ms": 0,
+			"first_stream_post_queued_behind": "none"
+		}`)
+
+		msg, err := ParseMessage(raw)
+		require.NoError(t, err)
+		res, ok := msg.(ResultMessage)
+		require.True(t, ok)
+
+		require.NotNil(t, res.FirstStreamPostQueueWaitMs)
+		assert.Equal(t, int64(0), *res.FirstStreamPostQueueWaitMs)
+		assert.Equal(t, FirstPostQueuedBehindNone, res.FirstStreamPostQueuedBehind)
+	})
+
+	t.Run("absent on a result that omits them", func(t *testing.T) {
+		raw := []byte(`{
+			"type": "result",
+			"subtype": "success",
+			"session_id": "s",
+			"uuid": "11111111-1111-1111-1111-111111111111",
+			"is_error": false,
+			"result": "done"
+		}`)
+
+		msg, err := ParseMessage(raw)
+		require.NoError(t, err)
+		res, ok := msg.(ResultMessage)
+		require.True(t, ok)
+
+		assert.Nil(t, res.FirstStreamPostQueueWaitMs)
+		assert.Nil(t, res.FirstTextPostMs)
+		assert.Nil(t, res.FirstTextPostWallMs)
+		// Empty is distinct from "none": the producer said nothing.
+		assert.Empty(t, res.FirstStreamPostQueuedBehind)
+		assert.NotEqual(t, FirstPostQueuedBehindNone,
+			res.FirstStreamPostQueuedBehind)
+	})
+
+	t.Run("all queued-behind members round-trip", func(t *testing.T) {
+		all := []FirstPostQueuedBehind{
+			FirstPostQueuedBehindDurablePost,
+			FirstPostQueuedBehindEphemeralPost,
+			FirstPostQueuedBehindRetryBackoff,
+			FirstPostQueuedBehindHold,
+			FirstPostQueuedBehindNone,
+		}
+		require.Len(t, all, 5, "TS union has 5 members at sdk.d.ts L5435")
+
+		for _, v := range all {
+			raw := []byte(`{
+				"type": "result",
+				"subtype": "success",
+				"session_id": "s",
+				"uuid": "11111111-1111-1111-1111-111111111111",
+				"is_error": false,
+				"first_stream_post_queued_behind": "` + string(v) + `"
+			}`)
+			msg, err := ParseMessage(raw)
+			require.NoError(t, err)
+			res, ok := msg.(ResultMessage)
+			require.True(t, ok)
+			assert.Equal(t, v, res.FirstStreamPostQueuedBehind)
+		}
+	})
+
+	// Open set: a newer CLI may name a queueing cause this SDK predates.
+	t.Run("unknown queued-behind survives", func(t *testing.T) {
+		raw := []byte(`{
+			"type": "result",
+			"subtype": "success",
+			"session_id": "s",
+			"uuid": "11111111-1111-1111-1111-111111111111",
+			"is_error": false,
+			"first_stream_post_queued_behind": "some_new_queue"
+		}`)
+
+		msg, err := ParseMessage(raw)
+		require.NoError(t, err)
+		res, ok := msg.(ResultMessage)
+		require.True(t, ok)
+		assert.Equal(t, FirstPostQueuedBehind("some_new_queue"),
+			res.FirstStreamPostQueuedBehind)
+	})
+}
+
+// TestUserMessageInlinePastes covers the submit path and decode of
+// inline_pastes, the sibling of pasted_content for pastes left in place.
+func TestUserMessageInlinePastes(t *testing.T) {
+	msg := UserMessage{
+		Type: "user",
+		Message: APIUserMessage{
+			Role: "user",
+			Content: []UserContentBlock{
+				{Type: "text", Text: "fix this: panic: nil map"},
+			},
+		},
+		InlinePastes: []string{"panic: nil map"},
+	}
+
+	data, err := json.Marshal(msg)
+	require.NoError(t, err)
+
+	var got map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(data, &got))
+	assert.JSONEq(t, `["panic: nil map"]`, string(got["inline_pastes"]))
+
+	data, err = json.Marshal(UserMessage{Type: "user"})
+	require.NoError(t, err)
+	got = nil
+	require.NoError(t, json.Unmarshal(data, &got))
+	assert.NotContains(t, got, "inline_pastes")
+
+	var decoded UserMessage
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"type": "user",
+		"message": {"role": "user", "content": []},
+		"parent_tool_use_id": null,
+		"inline_pastes": ["a", "b"]
+	}`), &decoded))
+	assert.Equal(t, []string{"a", "b"}, decoded.InlinePastes)
+}
+
+// TestAssortedParityV0_3_290 covers the small v0.3.290 decode-side adds:
+// init view_mode, informational tag, the task-notification session-inbox
+// subkind and fireReason, provider_not_allowed, and the first-text-post
+// queue timings.
+func TestAssortedParityV0_3_290(t *testing.T) {
+	t.Run("init view_mode", func(t *testing.T) {
+		msg, err := ParseMessage([]byte(`{
+			"type": "system", "subtype": "init",
+			"uuid": "550e8400-e29b-41d4-a716-446655440800",
+			"session_id": "s", "apiKeySource": "env", "cwd": "/w",
+			"tools": [], "mcp_servers": [], "model": "m",
+			"permissionMode": "default", "slash_commands": [],
+			"output_style": "default", "view_mode": "focus"
+		}`))
+		require.NoError(t, err)
+		assert.Equal(t, ViewModeFocus, msg.(SystemMessage).ViewMode)
+	})
+
+	t.Run("informational tag", func(t *testing.T) {
+		var got InformationalMessage
+		require.NoError(t, json.Unmarshal([]byte(`{
+			"type": "system", "subtype": "informational",
+			"content": "Compacted", "level": "notice",
+			"tag": "some_feature", "uuid": "u", "session_id": "s"
+		}`), &got))
+		assert.Equal(t, "some_feature", got.Tag)
+	})
+
+	t.Run("scheduled trigger fire reason and session inbox", func(t *testing.T) {
+		var origin MessageOrigin
+		require.NoError(t, json.Unmarshal([]byte(`{
+			"kind": "task-notification",
+			"subkind": "scheduled-trigger",
+			"fireReason": "catch_up"
+		}`), &origin))
+		assert.Equal(t, MessageOriginSubkindScheduledTrigger, origin.Subkind)
+		assert.Equal(t, "catch_up", origin.FireReason)
+
+		require.NoError(t, json.Unmarshal([]byte(`{
+			"kind": "task-notification", "subkind": "session-inbox"
+		}`), &origin))
+		assert.Equal(t, MessageOriginSubkindSessionInbox, origin.Subkind)
+	})
+
+	t.Run("result startup reason and text post queue", func(t *testing.T) {
+		var got ResultMessage
+		require.NoError(t, json.Unmarshal([]byte(`{
+			"type": "result", "subtype": "success",
+			"startup_failure_reason": "provider_not_allowed",
+			"first_text_post_queue_wait_ms": 42,
+			"first_text_post_queued_behind": "durable_post"
+		}`), &got))
+		assert.Equal(t, StartupFailureProviderNotAllowed, got.StartupFailureReason)
+		require.NotNil(t, got.FirstTextPostQueueWaitMs)
+		assert.Equal(t, int64(42), *got.FirstTextPostQueueWaitMs)
+		assert.Equal(t, FirstPostQueuedBehind("durable_post"), got.FirstTextPostQueuedBehind)
 	})
 }

@@ -12,7 +12,7 @@ stdin/stdout, giving you access to Claude's tool use, extended thinking,
 session management, and hook system.
 
 This repository tracks the official TypeScript Agent SDK surface through the
-v0.3.263 catchup work, using Go idioms where the API shape differs.
+v0.3.296 catchup work, using Go idioms where the API shape differs.
 
 ```mermaid
 flowchart TB
@@ -864,6 +864,172 @@ paths have unit coverage plus skipped integration slots until stable live CLI
 fixtures exist, and alpha task/agent behavior should still be checked against
 the installed Claude Code CLI version.
 
+The v0.3.278 catchup added:
+
+- MCP server provenance. `McpServerProvenance` (`name`, `source`) rides the
+  permission request, the tool-related hook inputs, and the `mcp_status` and
+  init reporting rows. Trust keys on `source`, never on the name or the
+  `mcp__*` tool-name prefix: `source: "sdk"` is the only value that means an
+  in-process server the host itself registered, and a configured server of the
+  same name can never claim it. `IsSDK()` on the status rows is the decode-side
+  check.
+- `ProjectConfigRoot` option and `--project-config-root` flag — the trusted
+  checkout a worktree is of. Project settings, `.mcp.json`, the `.claude` config
+  trees and `CLAUDE_PROJECT_DIR` come from here rather than `cwd`, so what the
+  branch checked out in `cwd` is not what the session runs.
+- `highlights` thinking display mode — one short title per stretch of thinking.
+  The API honors it only for Anthropic-hosted Claude Code sessions; any other
+  client's request still succeeds but the session falls back to `omitted` once
+  the API rejects the value.
+- `userSettings` source on `update_settings` — takes `effortLevel` only, saved
+  as the default for the session's current model as `/effort` saves it, without
+  changing the running session's level.
+- `StartupFailureReason` and `SDKStartupFailureReason` on the result frame — a
+  machine-readable cause a stream-json run writes before exiting on a known
+  startup failure, so a host can offer the fix instead of a blind retry.
+- `UsageReport` and `SDKUsageReport` on the assistant message that delivers a
+  `/usage` result — the session totals, the plan's usage rows as the server
+  sent them, and extra-usage spend, for a client that renders a card from data
+  rather than the text.
+- Four first-post timing fields on the result frame:
+  `FirstStreamPostQueueWaitMs`, `FirstStreamPostQueuedBehind`,
+  `FirstTextPostMs`, `FirstTextPostWallMs`.
+- `Stream.RenameSession` — the `rename_session` control request, with a source
+  (`remote`, the CLI default, or `host`) and a session-id guard that refuses
+  the rename if this process has since moved to another conversation.
+- Four one-field adds: `AgentDefinition.OmitClaudeMd` (run a subagent without
+  the user/project/local CLAUDE.md files, managed policy kept),
+  `SlashCommand.Builtin`, `HooksListingPolicy.PolicyUnreadable` (managed
+  settings present but unreadable, which fails `edit_hook` closed), and
+  `TaskNotificationMessage.Reason` (`worker_restart`).
+- `UserMessage.PastedContent` — content pasted rather than typed, each entry the
+  `MessageParam['content']` union modeled as `PastedContentEntry` (a string or
+  a block array).
+- Settings: npm marketplace `version`/`registry`, `modelPricing.multiplier`
+  range widened to `(0, 10]`, `taskOutputMaxChars` deprecated to a no-op (the
+  TaskOutput tool was removed), `skipLfs` documented as a no-op, and
+  `workflowSizeGuideline` "medium" now `<10` agents.
+- A behavior correction to `TotalCostUSD`/`ModelUsage`: a resumed or forked
+  session continues from the total its transcript saved rather than starting
+  fresh, so the first result already carries the earlier turns.
+
+PRs in this cycle (squash-merged): #260/#262/#263 MCP server provenance, #264
+`projectConfigRoot`, #265 `highlights`, #266 `userSettings`, #267
+`startup_failure_reason`, #268 `usage_report`, #269 first-post timings, #270
+`rename_session`, #271 assorted field adds, #272 `pasted_content`, #273 Settings
+parity, plus this docs refresh.
+
+Deferred in v0.3.278:
+
+- `set_chrome_browser_hints` — `sdk.mjs` emits it via `Query.setChromeBrowserHints`,
+  but it has no declaration anywhere in `sdk.d.ts` (no request type, no method on
+  the typed `Query`), so there is nothing to model without guessing. Same posture
+  as `set_mcp_permission_mode_override` before v0.3.185 — wait for the wire shape.
+- `sdk-tools.d.ts` schema churn — the standing deferral since v0.3.207.
+- `bridge.d.ts` and `browser-sdk.d.ts` — no Go bridge/WebSocket transport exists.
+- `sdkMcpServerManifests` on initialize — tracked in #256.
+
+The v0.3.290 catchup added:
+
+- `Options.VerbatimPrompts` and `UserMessage.ClientComposed`. With the flag
+  set, the CLI delivers prompt text as written: no `@path` expansion and no
+  slash-command dispatch. Current CLIs also skip the turn-start attachment
+  pass for such a turn, so nested `CLAUDE.md`, skill listings and the like
+  arrive after the first tool call instead of with the prompt.
+- `Stream.SendMessage` — send a caller-built `UserMessage`, the analogue of
+  handing an `SDKUserMessage` to `streamInput`. It's the only way to set
+  `PastedContent`, the new `InlinePastes`, a per-message `ClientComposed`, a
+  client `UUID` or a `Priority`.
+- `Stream.GetTaskOutput` — the `get_task_output` control request: the last
+  8 KiB a background shell or Monitor task wrote, plus total size and a
+  truncated flag, without a model turn.
+- MCP Apps (SEP-1865) support: `McpServerStatus.Tools` with each tool's
+  validated `_meta` (`UIResourceURI()` resolves the `ui://` resource it
+  declares), and `Stream.ReadMcpResource`, the `mcp_read_resource` control
+  request that fetches that resource from a server the CLI dialed. The reply
+  is untrusted third-party HTML; render it sandboxed. The status rows also
+  gained the long-missing `error`, `scope` and `disabled` state.
+- `conversation_reset` gains `trigger` (`clear`, `plan_mode_exit`,
+  `fresh_session`, `onboarding`; open set), the `user_message_uuid` of the
+  `/clear` that caused it, and a display `timestamp`.
+- Init gains `plugin_errors` (load-time plugin failures, with the resolved
+  path of a directory entry that didn't load at all), `view_mode`, and the
+  plugin row's manifest `version`.
+- Small decode-side adds: informational `tag`, the `session-inbox`
+  task-notification subkind and scheduled-trigger `fireReason`, the
+  `provider_not_allowed` startup failure reason, and the first-text-post
+  queue timings on the result.
+- Settings: `availableModelsMatch`, `deniedModels`,
+  `allowClaudeInChromeWithManagedMcp`, `allowedProviders` (an empty list
+  allows *no* provider, so it is tagged `omitzero`), `maxProseWidth`,
+  `idleCompaction`, the per-model `autoCompactWindow` (`"auto"` or a token
+  count), and `attribution: false` via `SettingsAttribution.HideAll`.
+- A wire fix: `SetMaxThinkingTokens(ctx, nil)` now sends an explicit
+  `max_thinking_tokens: null`. Current CLIs read an absent key as "leave the
+  budget alone", so the old omitted encoding had quietly stopped resetting.
+
+PRs in this cycle (squash-merged): #277 `verbatimPrompts`, #278
+`inline_pastes`, #279 `get_task_output`, #280 `mcp_status` tools and `_meta`,
+#281 `mcp_read_resource`, #282 `conversation_reset` trigger, #283
+`plugin_errors`, #284 assorted field adds, #286 Settings parity, #287
+`attribution` boolean, #288 the thinking-tokens null, #290
+`Stream.SendMessage`, plus this docs refresh. #285 fixed a register-after-write
+race in `Initialize` found along the way.
+
+Deferred in v0.3.290:
+
+- `prewarm()` / `SpareProcess` / `ClaimOptions` (alpha). It rides
+  `--await-claim` plus a `claim_session` control request whose shape is not
+  declared in `sdk.d.ts`, and its claim-refused / fall-back-to-`query()`
+  lifecycle is a design call for the Go API rather than a mechanical port.
+- `sdkMcpServerManifestsOrigin` and `sdk_mcp_manifests_parked` — only
+  meaningful alongside `sdkMcpServerManifests`, tracked in #256.
+- Control subtypes `sdk.mjs` emits with no `sdk.d.ts` declaration
+  (`export_conversation`, `get_status`, `get_plan`, the Chrome and dialog
+  getters, `set_prompt_suggestions_paused`), and the `./core` JS entrypoint.
+- `sdk-tools.d.ts` / `bridge.d.ts` churn — the standing deferrals.
+
+The v0.3.296 catchup added:
+
+- Per-run task identity: `RunID` on every `task_*` message, on each
+  `BackgroundTask` level entry and on a background task's saved notification
+  (`MessageOrigin.RunID`). A resumed task keeps its `TaskID` and opens a new
+  run, so `RunID` is how a host drops a late frame from an earlier run. One
+  task's run ids sort in open order; nothing else about the format is
+  promised. `ParentTaskID` on `TaskStartedMessage` and `BackgroundTask` names
+  the subagent task that launched this one, and entries gain `SubagentType`.
+- `AgentID` on `AssistantMessage` and `UserMessage`: the `task_id` of the
+  subagent that produced the frame, stable across resume. CLI 2.1.296
+  forwards a subagent's prompt (a user frame) but not its assistant turns by
+  default.
+- `AgentDefinition.AutoCompactWindow`, which can only lower the window a
+  subagent inherits.
+- `SettingsHook.OnFailure`: `"block"` makes a command or http hook that
+  can't start, times out, exits non-0/2 or prints invalid JSON fail closed,
+  as if it exited 2.
+- `SDKControlInitializeResponse.ClaudeCodeVersion`, so a caller can gate
+  features right after `Connect`; the `org_config_required_unavailable`
+  (retryable) and `org_config_refused` (not) startup failure reasons; and
+  `RateLimitInfo.OverageEnabled`.
+- An argv change: scalar flags now go out as one `--flag=value` element, as
+  `sdk.mjs` does, so a value starting with `-` (a system prompt like
+  `"- be terse"`, a dash-leading path) can't be read as the next option.
+  `--settings`, `--managed-settings`, `--mcp-config` and `ExtraArgs` keep the
+  pair and join only for such a value.
+
+PRs in this cycle (squash-merged): #295 task `run_id`/`parent_task_id`, #296
+`agent_id`, #297 `autoCompactWindow`, #298 hook `onFailure`, #299 init
+version and enum parity, #300 `--flag=value` argv, plus this docs refresh.
+
+Deferred in v0.3.296:
+
+- The `sandbox` option's new merge into inline `settings` (key-by-key, with
+  restriction lists unioned). The Go `WithSandbox` has never reached the CLI
+  at all, and its `SandboxSettings` type doesn't match upstream; fixing it
+  means changing a public signature. Tracked in #301.
+- `bridge.d.ts` `claudeCodeVersion` (bridge host side) and `sdk-tools.d.ts`
+  churn — the standing deferrals.
+
 ### Porting from the TypeScript SDK - Go-side differences
 
 A short list of places the Go SDK consciously diverges from the TS shape; if
@@ -885,6 +1051,18 @@ you are translating TS code, watch for these:
   currently expose the upstream top-level user-facing `skills` option; the
   existing `Options.Skills` mirrors the control-init system-prompt loading
   allowlist, which is a different surface.
+- **`PermissionMode` defaults to `"default"`.** `DefaultOptions()` sets
+  `PermissionModeDefault`, so the Go SDK always passes `--permission-mode
+  default` and keeps manual approvals through `CanUseTool`. Since v0.3.290 a TS
+  host that omits `permissionMode` gets whatever the CLI picks, which is the
+  settings' `permissions.defaultMode` or else `auto` where auto mode is
+  available. Set `PermissionMode` to `""` for the TS behavior.
+- **`WithSandbox` is not sent to the CLI (#301).** `Options.Sandbox` is
+  never read, so it enables nothing. Until that's fixed, put the block in
+  `WithSettings(Settings{Sandbox: &SettingsSandbox{...}})`, which is sent
+  as `--settings`. Note that TS sets `failIfUnavailable: true` when the
+  option enables the sandbox; set it yourself to get the same fail-closed
+  behavior.
 - **`Effort` `"max"` / `"xhigh"` are model-gated.** `EffortMax` requires Opus
   4.6/4.7 or Sonnet 4.6; `EffortXHigh` requires Opus 4.7. On unsupported
   models the CLI silently downgrades per its own policy. The CLI is the

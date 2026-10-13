@@ -191,13 +191,16 @@ func (p *Protocol) doInitialize(ctx context.Context) error {
 		},
 	}
 
-	// Send request.
+	// Register before writing: a CLI that answers before the entry exists
+	// would have its response dropped as unmatched, and we'd wait out ctx.
+	ch := make(chan SDKControlResponse, 1)
+	p.pendingReqs.Store(requestID, ch)
 	if err := p.transport.Write(ctx, req); err != nil {
+		p.pendingReqs.Delete(requestID)
 		return fmt.Errorf("failed to send initialize request: %w", err)
 	}
 
-	// Wait for response.
-	resp, err := p.waitForSDKResponse(ctx, requestID)
+	resp, err := p.waitForSDKResponse(ctx, requestID, ch)
 	if err != nil {
 		return fmt.Errorf("initialization failed: %w", err)
 	}
@@ -226,6 +229,9 @@ func (p *Protocol) initResult() *SDKControlInitializeResponse {
 // SendMessage sends a user message to the CLI.
 // Note: Initialize() should be called before SendMessage().
 func (p *Protocol) SendMessage(ctx context.Context, msg UserMessage) error {
+	if p.options != nil && p.options.VerbatimPrompts {
+		msg.ClientComposed = true
+	}
 	return p.transport.Write(ctx, msg)
 }
 
@@ -311,6 +317,21 @@ func parseMatchedAskRule(v interface{}) *MatchedAskRule {
 	}
 }
 
+// parseMCPServerProvenance extracts the mcp_server object from a permission or
+// hook payload. It returns nil when the field is absent or malformed.
+func parseMCPServerProvenance(v interface{}) *MCPServerProvenance {
+	m, ok := v.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	name, _ := m["name"].(string)
+	source, _ := m["source"].(string)
+	return &MCPServerProvenance{
+		Name:   name,
+		Source: MCPServerSource(source),
+	}
+}
+
 // handlePermissionRequest processes a permission check request.
 func (p *Protocol) handlePermissionRequest(ctx context.Context, req ControlRequest) SDKControlResponse {
 	// Extract request details (per TypeScript SDK: tool_name, input).
@@ -322,6 +343,7 @@ func (p *Protocol) handlePermissionRequest(ctx context.Context, req ControlReque
 	suppressAlwaysAllowRule, _ := req.Payload["suppress_always_allow_rule"].(bool)
 	defaultToNo, _ := req.Payload["default_to_no"].(bool)
 	matchedAskRule := parseMatchedAskRule(req.Payload["matched_ask_rule"])
+	mcpServer := parseMCPServerProvenance(req.Payload["mcp_server"])
 
 	// Build permission request.
 	permReq := ToolPermissionRequest{
@@ -334,6 +356,7 @@ func (p *Protocol) handlePermissionRequest(ctx context.Context, req ControlReque
 			SuppressAlwaysAllowRule: suppressAlwaysAllowRule,
 			DefaultToNo:             defaultToNo,
 			MatchedAskRule:          matchedAskRule,
+			MCPServer:               mcpServer,
 		},
 	}
 
@@ -555,6 +578,7 @@ func (p *Protocol) handleHookCallback(ctx context.Context, req ControlRequest) S
 			BaseHookInput: base,
 			ToolName:      getString(inputData, "tool_name"),
 			ToolInput:     marshalJSON(inputData["tool_input"]),
+			MCPServer:     parseMCPServerProvenance(inputData["mcp_server"]),
 		}
 	case HookTypePostToolUse:
 		input = PostToolUseInput{
@@ -562,6 +586,7 @@ func (p *Protocol) handleHookCallback(ctx context.Context, req ControlRequest) S
 			ToolName:      getString(inputData, "tool_name"),
 			ToolInput:     marshalJSON(inputData["tool_input"]),
 			ToolResponse:  marshalJSON(inputData["tool_response"]),
+			MCPServer:     parseMCPServerProvenance(inputData["mcp_server"]),
 		}
 	case HookTypeUserPromptSubmit:
 		input = UserPromptSubmitInput{
@@ -626,6 +651,7 @@ func (p *Protocol) handleHookCallback(ctx context.Context, req ControlRequest) S
 			ToolInput:     marshalJSON(inputData["tool_input"]),
 			Error:         getString(inputData, "error"),
 			IsInterrupt:   getBool(inputData, "is_interrupt"),
+			MCPServer:     parseMCPServerProvenance(inputData["mcp_server"]),
 		}
 	case HookTypeNotification:
 		input = NotificationInput{
@@ -660,6 +686,7 @@ func (p *Protocol) handleHookCallback(ctx context.Context, req ControlRequest) S
 			BaseHookInput: base,
 			ToolName:      getString(inputData, "tool_name"),
 			ToolInput:     marshalJSON(inputData["tool_input"]),
+			MCPServer:     parseMCPServerProvenance(inputData["mcp_server"]),
 		}
 	case HookTypePermissionDenied:
 		input = PermissionDeniedInput{
@@ -668,6 +695,7 @@ func (p *Protocol) handleHookCallback(ctx context.Context, req ControlRequest) S
 			ToolInput:     marshalJSON(inputData["tool_input"]),
 			ToolUseID:     getString(inputData, "tool_use_id"),
 			Reason:        getString(inputData, "reason"),
+			MCPServer:     parseMCPServerProvenance(inputData["mcp_server"]),
 		}
 	case HookTypeCwdChanged:
 		input = CwdChangedInput{
@@ -987,6 +1015,7 @@ func (p *Protocol) handleSDKPermissionRequest(ctx context.Context, req SDKContro
 			SuppressAlwaysAllowRule: req.Request.SuppressAlwaysAllowRule,
 			DefaultToNo:             req.Request.DefaultToNo,
 			MatchedAskRule:          req.Request.MatchedAskRule,
+			MCPServer:               req.Request.MCPServer,
 		},
 	}
 
@@ -1100,6 +1129,7 @@ func (p *Protocol) handleSDKHookCallback(ctx context.Context, req SDKControlRequ
 			BaseHookInput: base,
 			ToolName:      getString(hookInput, "tool_name"),
 			ToolInput:     marshalJSON(hookInput["tool_input"]),
+			MCPServer:     parseMCPServerProvenance(hookInput["mcp_server"]),
 		}
 	case "PostToolUse":
 		input = PostToolUseInput{
@@ -1107,6 +1137,7 @@ func (p *Protocol) handleSDKHookCallback(ctx context.Context, req SDKControlRequ
 			ToolName:      getString(hookInput, "tool_name"),
 			ToolInput:     marshalJSON(hookInput["tool_input"]),
 			ToolResponse:  marshalJSON(hookInput["tool_response"]),
+			MCPServer:     parseMCPServerProvenance(hookInput["mcp_server"]),
 		}
 	case "UserPromptSubmit":
 		input = UserPromptSubmitInput{
@@ -1171,6 +1202,7 @@ func (p *Protocol) handleSDKHookCallback(ctx context.Context, req SDKControlRequ
 			ToolInput:     marshalJSON(hookInput["tool_input"]),
 			Error:         getString(hookInput, "error"),
 			IsInterrupt:   getBool(hookInput, "is_interrupt"),
+			MCPServer:     parseMCPServerProvenance(hookInput["mcp_server"]),
 		}
 	case "Notification":
 		input = NotificationInput{
@@ -1205,6 +1237,7 @@ func (p *Protocol) handleSDKHookCallback(ctx context.Context, req SDKControlRequ
 			BaseHookInput: base,
 			ToolName:      getString(hookInput, "tool_name"),
 			ToolInput:     marshalJSON(hookInput["tool_input"]),
+			MCPServer:     parseMCPServerProvenance(hookInput["mcp_server"]),
 		}
 	case "PermissionDenied":
 		input = PermissionDeniedInput{
@@ -1213,6 +1246,7 @@ func (p *Protocol) handleSDKHookCallback(ctx context.Context, req SDKControlRequ
 			ToolInput:     marshalJSON(hookInput["tool_input"]),
 			ToolUseID:     getString(hookInput, "tool_use_id"),
 			Reason:        getString(hookInput, "reason"),
+			MCPServer:     parseMCPServerProvenance(hookInput["mcp_server"]),
 		}
 	case "CwdChanged":
 		input = CwdChangedInput{
@@ -1536,11 +1570,12 @@ func (p *Protocol) handleSDKControlResponse(resp SDKControlResponse) error {
 	return nil
 }
 
-// waitForSDKResponse waits for an SDK control response with the given request ID.
-func (p *Protocol) waitForSDKResponse(ctx context.Context, requestID string) (SDKControlResponse, error) {
-	ch := make(chan SDKControlResponse, 1)
-	p.pendingReqs.Store(requestID, ch)
-
+// waitForSDKResponse waits for the SDK control response to requestID on ch,
+// which the caller must have registered in pendingReqs before writing the
+// request.
+func (p *Protocol) waitForSDKResponse(
+	ctx context.Context, requestID string, ch chan SDKControlResponse,
+) (SDKControlResponse, error) {
 	select {
 	case <-ctx.Done():
 		p.pendingReqs.Delete(requestID)

@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"iter"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -755,6 +756,88 @@ func TestIntegrationTaskStartedBackgrounding(t *testing.T) {
 	t.Skip("not triggerable from CLI: runner CLI 2.1.222 omits is_backgrounded and spawn_depth from task_started")
 }
 
+// TestIntegrationTaskRunID backgrounds one Bash command and checks that every
+// task frame for it names the same run, and that the run shows up in the
+// background_tasks_changed level. Skips on CLIs that predate run_id
+// (sdk.d.ts v0.3.296).
+func TestIntegrationTaskRunID(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	opts := append(isolatedClientOptions(t),
+		WithCwd(t.TempDir()),
+		WithSystemPrompt(
+			"You are a helpful assistant. When asked to run a shell command, "+
+				"use Bash immediately and do not describe it first.",
+		),
+		WithPermissionMode(PermissionModeBypassAll),
+		WithAllowDangerouslySkipPermissions(true),
+		WithMaxTurns(4),
+	)
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	defer cancel()
+
+	stream, err := client.Stream(ctx)
+	require.NoError(t, err)
+	defer stream.Close()
+
+	require.NoError(t, stream.Send(ctx,
+		"Run the Bash command `sleep 2 && echo ok` with run_in_background "+
+			"set to true. Then wait for its completion notification and "+
+			"reply DONE.",
+	))
+
+	var (
+		started      *TaskStartedMessage
+		notification *TaskNotificationMessage
+		levelRunIDs  = map[string]string{}
+	)
+	for msg := range stream.Messages() {
+		switch m := msg.(type) {
+		case TaskStartedMessage:
+			if started == nil {
+				started = &m
+			}
+		case TaskNotificationMessage:
+			if notification == nil {
+				notification = &m
+			}
+		case BackgroundTasksChangedMessage:
+			for _, task := range m.Tasks {
+				levelRunIDs[task.TaskID] = task.RunID
+			}
+		case ResultMessage:
+			// The notification can land after the first result; stop
+			// once both bookends are in.
+			if notification != nil {
+				cancel()
+			}
+		}
+		if started != nil && notification != nil {
+			break
+		}
+	}
+
+	require.NotNil(t, started, "expected a task_started frame")
+	if started.RunID == "" {
+		t.Skip("not triggerable from CLI: this CLI build predates run_id")
+	}
+	require.NotNil(t, notification, "expected a task_notification frame")
+	assert.Equal(t, started.TaskID, notification.TaskID)
+	assert.Equal(t, started.RunID, notification.RunID,
+		"one run must carry one run_id on every task_* frame")
+	assert.Empty(t, started.ParentTaskID,
+		"a task launched from the main thread has no parent")
+
+	if levelRunID, ok := levelRunIDs[started.TaskID]; ok {
+		assert.Equal(t, started.RunID, levelRunID)
+	}
+}
+
 func TestIntegrationInitEffort(t *testing.T) {
 	skipIfNoToken(t)
 	skipIfNoCLI(t)
@@ -764,6 +847,69 @@ func TestIntegrationInitEffort(t *testing.T) {
 	// carries apiKeySource and capabilities but no effort key at all, so a
 	// live assertion here could only ever re-assert the absent state.
 	t.Skip("not triggerable from CLI: effort is published on Remote Control bridge init frames, not on the subprocess transport's init message")
+}
+
+// TestIntegrationAgentAutoCompactWindow defines a subagent with
+// autoCompactWindow and runs it once. Reaching the window in a test is not
+// practical, so this proves the CLI accepts the key on an agent definition
+// and still runs the agent to completion (sdk.d.ts v0.3.296).
+func TestIntegrationAgentAutoCompactWindow(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	opts := append(isolatedClientOptions(t),
+		WithCwd(t.TempDir()),
+		WithAgents(map[string]AgentDefinition{
+			"adder": {
+				Name:              "adder",
+				Description:       "Answers arithmetic questions in one word",
+				Prompt:            "Answer the arithmetic question in one word.",
+				Tools:             []string{},
+				AutoCompactWindow: 100000,
+			},
+		}),
+		WithPermissionMode(PermissionModeBypassAll),
+		WithAllowDangerouslySkipPermissions(true),
+		WithMaxTurns(3),
+	)
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+
+	stream, err := client.Stream(ctx)
+	require.NoError(t, err)
+	defer stream.Close()
+
+	require.NoError(t, stream.Send(ctx,
+		"Use the Agent tool exactly once, with subagent_type adder, to ask: "+
+			"what is 2+2? Then reply with its answer.",
+	))
+
+	var (
+		started *TaskStartedMessage
+		status  TaskNotificationStatus
+	)
+	for msg := range stream.Messages() {
+		switch m := msg.(type) {
+		case TaskStartedMessage:
+			if m.TaskType == "local_agent" && started == nil {
+				started = &m
+			}
+		case TaskNotificationMessage:
+			if started != nil && m.TaskID == started.TaskID {
+				status = m.Status
+			}
+		case ResultMessage:
+			cancel()
+		}
+	}
+
+	require.NotNil(t, started, "expected the adder subagent to start")
+	assert.Equal(t, "adder", started.SubagentType)
+	assert.Equal(t, TaskNotificationStatusCompleted, status)
 }
 
 func TestIntegrationSessionStartReloadSkills(t *testing.T) {
@@ -845,6 +991,79 @@ func TestIntegrationUserMessageSubagentFields(t *testing.T) {
 	t.Skip("requires CLI to emit a user-side tool-result message from a Task-tool subagent (populates user message subagent_type/task_description); tracked in INTEGRATION-FOLLOWUPS.md")
 }
 
+// TestIntegrationMessageAgentID runs one foreground subagent and checks that
+// the subagent frames forwarded on the stream carry agent_id equal to the
+// task_id of its task_started frame, while main-thread messages carry none.
+// CLI 2.1.296 forwards the subagent's prompt as a user message but not its
+// assistant turns, so both kinds are collected. Skips on CLIs that predate
+// agent_id (sdk.d.ts v0.3.296).
+func TestIntegrationMessageAgentID(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	opts := append(isolatedClientOptions(t),
+		WithCwd(t.TempDir()),
+		WithPermissionMode(PermissionModeBypassAll),
+		WithAllowDangerouslySkipPermissions(true),
+		WithMaxTurns(3),
+	)
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+
+	stream, err := client.Stream(ctx)
+	require.NoError(t, err)
+	defer stream.Close()
+
+	require.NoError(t, stream.Send(ctx,
+		"Use the Agent tool exactly once, with subagent_type "+
+			"general-purpose, to ask: what is 2+2? Answer in one word. "+
+			"Then reply with the subagent's answer.",
+	))
+
+	var (
+		agentTaskIDs   = map[string]bool{}
+		subagentIDs    []string
+		mainThreadSeen bool
+	)
+	for msg := range stream.Messages() {
+		switch m := msg.(type) {
+		case TaskStartedMessage:
+			if m.TaskType == "local_agent" {
+				agentTaskIDs[m.TaskID] = true
+			}
+		case AssistantMessage:
+			if m.ParentToolUseID == nil {
+				mainThreadSeen = true
+				assert.Empty(t, m.AgentID,
+					"a main-thread assistant message has no agent_id")
+				continue
+			}
+			subagentIDs = append(subagentIDs, m.AgentID)
+		case UserMessage:
+			if m.ParentToolUseID != nil {
+				subagentIDs = append(subagentIDs, m.AgentID)
+			}
+		case ResultMessage:
+			cancel()
+		}
+	}
+
+	require.True(t, mainThreadSeen, "expected a main-thread assistant message")
+	require.NotEmpty(t, agentTaskIDs, "expected a local_agent task_started")
+	require.NotEmpty(t, subagentIDs, "expected forwarded subagent messages")
+	if subagentIDs[0] == "" {
+		t.Skip("not triggerable from CLI: this CLI build predates agent_id")
+	}
+	for _, id := range subagentIDs {
+		assert.True(t, agentTaskIDs[id],
+			"agent_id %q must name a local_agent task_id", id)
+	}
+}
+
 func TestIntegrationAssistantMessageError(t *testing.T) {
 	skipIfNoToken(t)
 	skipIfNoCLI(t)
@@ -920,6 +1139,33 @@ func TestIntegrationResultFirstFrameTimings(t *testing.T) {
 	if result.FirstStreamPostWallMs != nil && result.TimeOriginMs != nil {
 		t.Logf("origin=%d relative=%d wall=%d", *result.TimeOriginMs,
 			*result.FirstStreamPostMs, *result.FirstStreamPostWallMs)
+	}
+
+	// v0.3.278 splits the post timing further: how long the first post waited
+	// in the queue and what it waited on, plus when text specifically first
+	// went out. Conditional because older CLIs report the trio above without
+	// these.
+	if result.FirstStreamPostQueueWaitMs != nil {
+		t.Logf("queue_wait=%d queued_behind=%q",
+			*result.FirstStreamPostQueueWaitMs,
+			result.FirstStreamPostQueuedBehind)
+
+		assert.GreaterOrEqual(t, *result.FirstStreamPostQueueWaitMs, int64(0),
+			"a queue wait cannot be negative")
+
+		// The wait cannot exceed the time to the post it was waiting for.
+		assert.LessOrEqual(t, *result.FirstStreamPostQueueWaitMs,
+			*result.FirstStreamPostMs,
+			"the queue wait cannot exceed the time to the post itself")
+	}
+
+	if result.FirstTextPostMs != nil {
+		t.Logf("first_text_post=%d", *result.FirstTextPostMs)
+
+		// Text cannot go out before the stream's first post.
+		assert.GreaterOrEqual(t, *result.FirstTextPostMs,
+			*result.FirstStreamPostMs,
+			"the first text post cannot precede the first stream post")
 	}
 }
 
@@ -1811,6 +2057,51 @@ func TestIntegrationHookLifecycleMessages(t *testing.T) {
 	t.Logf("Observed hook_progress: %t", sawProgress)
 }
 
+// TestIntegrationInitializeClaudeCodeVersion checks the initialize response
+// reports the same CLI version the first system/init message does, which is
+// the point of the field: gating features before that message arrives.
+// Skips on CLIs that predate it (sdk.d.ts v0.3.296 L4623).
+func TestIntegrationInitializeClaudeCodeVersion(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	opts := append(isolatedClientOptions(t), WithMaxTurns(1))
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	stream, err := client.Stream(ctx)
+	require.NoError(t, err)
+	defer stream.Close()
+
+	init, err := stream.InitializationResult()
+	require.NoError(t, err)
+	if init.ClaudeCodeVersion == "" {
+		t.Skip("not triggerable from CLI: this CLI build predates " +
+			"claude_code_version on the initialize response")
+	}
+
+	require.NoError(t, stream.Send(ctx, "Say OK."))
+
+	var initVersion string
+	for msg := range stream.Messages() {
+		switch m := msg.(type) {
+		case SystemMessage:
+			if m.Subtype == "init" && initVersion == "" {
+				initVersion = m.ClaudeCodeVersion
+			}
+		case ResultMessage:
+			cancel()
+		}
+	}
+
+	require.NotEmpty(t, initVersion, "expected a system/init message")
+	assert.Equal(t, initVersion, init.ClaudeCodeVersion)
+}
+
 // TestIntegrationStreamIntrospection exercises the cached-init readers added
 // in PR 18 against the live CLI. The CLI's initialize response populates
 // commands and models; we assert both are non-empty and that AccountInfo
@@ -2028,6 +2319,52 @@ func TestIntegrationStreamFileAndRuntime(t *testing.T) {
 		})
 		assert.True(t, wrote,
 			"update_settings did not persist outputStyle under %s", tempDir)
+	})
+
+	t.Run("update_settings userSettings", func(t *testing.T) {
+		// The userSettings source lands in Claude Code 2.1.278; before that
+		// the CLI accepts only localSettings and rejects this outright.
+		skipIfCLIOlderThan(t, "2.1.278")
+
+		// userSettings takes effortLevel only, and saves it as the default
+		// for the session's current model under modelSettings, the way
+		// /effort does. Assert it reaches disk rather than trusting a bare
+		// no-error: the CLI answering "ok" while writing the wrong file is
+		// exactly the drift worth catching, and this source writes outside
+		// the cwd.
+		configDir := filepath.Join(t.TempDir(), ".claude")
+		require.NoError(t, os.MkdirAll(configDir, 0755))
+
+		client, err := NewClient(
+			WithConfigDir(configDir),
+			WithSystemPrompt("You are a helpful assistant."),
+		)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, client.Close()) })
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		stream, err := client.Stream(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, stream.Close()) })
+
+		require.NoError(t, stream.UpdateSettings(ctx, SettingsSourceUser,
+			map[string]interface{}{"effortLevel": "high"}))
+
+		var wrote bool
+		_ = filepath.Walk(configDir, func(p string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() || !strings.HasSuffix(p, ".json") {
+				return nil
+			}
+			if b, rerr := os.ReadFile(p); rerr == nil &&
+				strings.Contains(string(b), "effortLevel") {
+				wrote = true
+			}
+			return nil
+		})
+		assert.True(t, wrote,
+			"update_settings did not persist effortLevel under %s", configDir)
 	})
 
 	t.Run("reload_output_styles", func(t *testing.T) {
@@ -2475,6 +2812,49 @@ func TestIntegrationSettingsV0_3_263RealCLI(t *testing.T) {
 			TaskOutputMaxChars: &taskChars,
 			TimeFormat:         SettingsTimeFormat24HourUTC,
 			TimeZone:           "Europe/Dublin",
+		}),
+	)
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	var result *ResultMessage
+	for msg := range client.Query(ctx, "Say OK.") {
+		if m, ok := msg.(ResultMessage); ok {
+			result = &m
+			break
+		}
+	}
+	require.NotNil(t, result, "the CLI must start and complete a turn on these settings")
+	assert.False(t, result.IsError, "settings must not fault the run")
+}
+
+// TestIntegrationSettingsV0_3_270RealCLI checks the CLI starts on the v0.3.270
+// settings additions rather than rejecting them. These are all top-level keys,
+// which an older CLI ignores cleanly (unlike an unknown nested source-union
+// member, which stalls the managed-settings handshake), so the assertion is
+// just that the run completes without faulting.
+func TestIntegrationSettingsV0_3_270RealCLI(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	bashEditDiff := false
+
+	opts := append(isolatedClientOptions(t),
+		WithSystemPrompt("You are a helpful assistant. Be very brief."),
+		WithMaxTurns(1),
+		WithManagedSettings(Settings{
+			BashEditDiffEnabled:     &bashEditDiff,
+			PrependPlugins:          []string{"sec-default@builtin"},
+			AppendPlugins:           []string{"telemetry@corp"},
+			GatewayInternalNetworks: []string{"203.0.113.0/24"},
+			MaxEffortLevel:          EffortHigh,
+			ModelSettings: map[string]SettingsModel{
+				"claude-opus-4-7": {MaxEffortLevel: EffortMax},
+			},
 		}),
 	)
 	client, err := NewClient(opts...)
@@ -4261,4 +4641,1383 @@ func TestIntegrationSystemPromptSnapshot(t *testing.T) {
 	assert.Contains(t, reply.String(), marker,
 		"snapshotting broke the preset append or stalled the handshake; "+
 			"reply was %q", reply.String())
+}
+
+func TestIntegrationResumeReason(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	// resume_reason only rides the frames of a turn the CLI re-ran after a
+	// worker restart interrupted it — the CLAUDE_CODE_RESUME_INTERRUPTED_TURN
+	// path. Reproducing it needs a host that kills a worker mid-turn and
+	// brings it back on the same session, which the subprocess transport does
+	// not do. Verified via unit tests in messages_test.go.
+	t.Skip("not triggerable from CLI: resume_reason requires a worker restart mid-turn; tracked in INTEGRATION-FOLLOWUPS.md")
+}
+
+func TestIntegrationResultIndex(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	// Probed against the runner CLI: a single-turn `claude -p` result carries
+	// neither result_index nor local_command. The numbering is emitted by the
+	// process hosting the run, and the in-process engine surface does not
+	// number yet, so a live assertion could only re-assert the absent state.
+	t.Skip("not triggerable from CLI: runner CLI omits result_index and local_command; tracked in INTEGRATION-FOLLOWUPS.md")
+}
+
+func TestIntegrationRateLimitLimitScope(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	// limitScope only appears on a denial driven by a spend limit that is not
+	// the member's own cap — a service, channel or pooled-group budget. The
+	// integration account has none of those exhausted, and exhausting one on
+	// purpose is not something a test run should do.
+	t.Skip("not triggerable from CLI: limitScope requires an exhausted service/channel/group-pool budget; tracked in INTEGRATION-FOLLOWUPS.md")
+}
+
+// TestIntegrationContextUsageCategoryKind exercises the v0.3.270 kind
+// discriminator on get_context_usage rows against the live CLI. The doc is
+// explicit that consumers must classify on kind rather than on the row's
+// English name, so the assertion is that a real report classifies its rows
+// into the known set — not that any particular name appears.
+//
+// A CLI predating the field returns rows with an empty kind; the test skips
+// in that case so the slot activates once the binary catches up.
+func TestIntegrationContextUsageCategoryKind(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	opts := append(isolatedClientOptions(t),
+		WithSystemPrompt("You are a helpful assistant. Be very brief."),
+		WithMaxTurns(1),
+	)
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	stream, err := client.Stream(ctx)
+	require.NoError(t, err)
+	defer stream.Close()
+
+	require.NoError(t, stream.Send(ctx, "Say hi."))
+	for msg := range stream.Messages() {
+		if _, ok := msg.(ResultMessage); ok {
+			break
+		}
+	}
+
+	usage, err := stream.GetContextUsage(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, usage)
+	require.NotEmpty(t, usage.Categories)
+
+	known := map[ContextUsageCategoryKind]bool{
+		ContextUsageUsed:     true,
+		ContextUsageFree:     true,
+		ContextUsageBuffer:   true,
+		ContextUsageDeferred: true,
+	}
+
+	var classified int
+	for _, cat := range usage.Categories {
+		if cat.Kind == "" {
+			continue
+		}
+		assert.True(t, known[cat.Kind],
+			"unknown category kind %q on row %q", cat.Kind, cat.Name)
+		classified++
+
+		// The old IsDeferred signal and the new Kind must not disagree.
+		if cat.IsDeferred {
+			assert.Equal(t, ContextUsageDeferred, cat.Kind,
+				"row %q is deferred but kind says otherwise", cat.Name)
+		}
+	}
+
+	if classified == 0 {
+		t.Skip("CLI predates get_context_usage categories[].kind")
+	}
+}
+
+// TestIntegrationReloadPluginsHoldOnCacheImpact exercises the v0.3.270
+// hold_on_cache_impact option against the live CLI.
+//
+// The session loads no plugins, so applying a reload changes nothing and the
+// check must come back clean — the assertion is that the CLI accepts the
+// option and does not hold. A CLI predating the option ignores the field and
+// answers with held absent, which the test treats as a skip so the slot
+// activates once the binary catches up.
+func TestIntegrationReloadPluginsHoldOnCacheImpact(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	opts := append(isolatedClientOptions(t),
+		WithSystemPrompt("You are a helpful assistant. Be very brief."),
+		WithMaxTurns(1),
+	)
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	stream, err := client.Stream(ctx)
+	require.NoError(t, err)
+	defer stream.Close()
+
+	got, err := stream.ReloadPlugins(ctx, ReloadPluginsOptions{
+		HoldOnCacheImpact: true,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	if got.Held == nil {
+		t.Skip("CLI predates reload_plugins hold_on_cache_impact")
+	}
+
+	assert.False(t, *got.Held,
+		"a session with no plugins has no tool-list change to hold on")
+	assert.Nil(t, got.CacheImpact, "nothing was held, so nothing to preview")
+}
+
+// TestIntegrationListPermissionRules exercises the v0.3.270
+// list_permission_rules control request against the live CLI.
+//
+// The session is launched with an --allowedTools rule, which the CLI reports
+// with source "cliArg" and session editability, so the assertion has something
+// concrete to find rather than depending on the machine's settings files.
+// CLIs predating the subtype reject it; the test skips in that case so the
+// slot activates once the binary catches up.
+func TestIntegrationListPermissionRules(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	opts := append(isolatedClientOptions(t),
+		WithSystemPrompt("You are a helpful assistant. Be very brief."),
+		WithAllowedTools([]string{"Bash(git status:*)"}),
+		WithMaxTurns(1),
+	)
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	stream, err := client.Stream(ctx)
+	require.NoError(t, err)
+	defer stream.Close()
+
+	state, err := stream.ListPermissionRules(ctx)
+	if err != nil {
+		t.Skipf("CLI does not support list_permission_rules: %v", err)
+	}
+	require.NotNil(t, state)
+
+	assert.NotEmpty(t, state.OriginalCwd, "the session always has an original cwd")
+
+	knownBehavior := map[PermissionRuleBehavior]bool{
+		PermissionRuleBehaviorAllow: true,
+		PermissionRuleBehaviorDeny:  true,
+		PermissionRuleBehaviorAsk:   true,
+	}
+	knownEditability := map[PermissionRuleEditability]bool{
+		PermissionRuleEditabilityPersistent: true,
+		PermissionRuleEditabilitySession:    true,
+		PermissionRuleEditabilityReadonly:   true,
+	}
+
+	var sawFlagRule bool
+	for _, rule := range state.Rules {
+		assert.True(t, knownBehavior[rule.Behavior],
+			"unknown behavior %q on rule %q", rule.Behavior, rule.Rule)
+		assert.True(t, knownEditability[rule.Editability],
+			"unknown editability %q on rule %q", rule.Editability, rule.Rule)
+		assert.NotEmpty(t, rule.Source, "every rule carries its provenance")
+		assert.NotEmpty(t, rule.Rule)
+
+		if rule.NotInEffect {
+			assert.Equal(t, PermissionRuleEditabilityReadonly, rule.Editability,
+				"a not-in-effect row must be readonly")
+		}
+		if rule.Rule == "Bash(git status:*)" {
+			sawFlagRule = true
+			assert.Equal(t, PermissionRuleBehaviorAllow, rule.Behavior)
+		}
+	}
+
+	assert.True(t, sawFlagRule,
+		"the --allowedTools rule this session launched with should be listed")
+}
+
+// TestIntegrationGetHooksListing exercises the v0.3.270 get_hooks_listing
+// control request against the live CLI.
+//
+// The eventCatalog is the invariant to lean on: the CLI always knows its own
+// hook-event set regardless of what hooks a session has configured, so it comes
+// back non-empty with a supportsMatcher flag per event. CLIs predating the
+// subtype reject it; the test skips so the slot activates once the binary
+// catches up.
+func TestIntegrationGetHooksListing(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	opts := append(isolatedClientOptions(t),
+		WithSystemPrompt("You are a helpful assistant. Be very brief."),
+		WithMaxTurns(1),
+	)
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	stream, err := client.Stream(ctx)
+	require.NoError(t, err)
+	defer stream.Close()
+
+	listing, err := stream.GetHooksListing(ctx)
+	if err != nil {
+		t.Skipf("CLI does not support get_hooks_listing: %v", err)
+	}
+	require.NotNil(t, listing)
+
+	require.NotEmpty(t, listing.EventCatalog,
+		"the CLI always knows its own hook-event set")
+	for _, ev := range listing.EventCatalog {
+		assert.NotEmpty(t, ev.Name, "every catalog entry names its event")
+	}
+
+	// Every listed hook row must point at an event and carry its display
+	// strings; the count summary must agree with the rows.
+	perEvent := map[string]int{}
+	for _, h := range listing.Hooks {
+		assert.NotEmpty(t, h.Event, "every hook row names its event")
+		assert.NotEmpty(t, h.Source, "every hook row carries its source")
+		perEvent[h.Event]++
+	}
+	for _, ev := range listing.Events {
+		assert.Equal(t, ev.HookCount, perEvent[ev.Name],
+			"event %q hookCount should match its listed rows", ev.Name)
+	}
+}
+
+// TestIntegrationMCPServerProvenancePermission asserts the CLI reports MCP
+// server provenance on the permission request for an mcp__* tool, and that an
+// in-process SDK server reports source "sdk" — the one value a configured
+// server can never claim (sdk.d.ts v0.3.278 L241).
+func TestIntegrationMCPServerProvenancePermission(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	type AddArgs struct {
+		A int `json:"a"`
+		B int `json:"b"`
+	}
+
+	server := CreateMcpServer(McpServerOptions{
+		Name:    "calculator",
+		Version: "1.0.0",
+		Tools: []ToolRegistrar{
+			ToolWithSchema("add_numbers", "Add two numbers together and return the sum",
+				map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"a": map[string]interface{}{"type": "integer"},
+						"b": map[string]interface{}{"type": "integer"},
+					},
+					"required": []string{"a", "b"},
+				},
+				func(ctx context.Context, args AddArgs) (ToolResult, error) {
+					return TextResult(fmt.Sprintf("%d", args.A+args.B)), nil
+				},
+			),
+		},
+	})
+
+	var (
+		mu        sync.Mutex
+		asked     bool
+		askedTool string
+		gotProv   *MCPServerProvenance
+	)
+
+	opts := append(isolatedClientOptions(t),
+		WithSystemPrompt(
+			"You are a helpful assistant. When asked to add numbers, "+
+				"you MUST use the add_numbers tool. Do not calculate manually.",
+		),
+		WithMcpServer("calculator", server),
+		WithPermissionMode(PermissionModeDefault),
+		WithCanUseTool(func(
+			ctx context.Context, req ToolPermissionRequest,
+		) PermissionResult {
+			mu.Lock()
+			defer mu.Unlock()
+			if strings.HasPrefix(req.ToolName, "mcp__") {
+				asked = true
+				askedTool = req.ToolName
+				gotProv = req.Context.MCPServer
+				t.Logf("permission for %s, mcp_server=%+v",
+					req.ToolName, req.Context.MCPServer)
+			}
+			return PermissionAllow{}
+		}),
+		WithMaxTurns(5),
+		WithStderr(func(data string) { t.Logf("CLI stderr: %s", data) }),
+	)
+
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	for msg := range client.Query(ctx, "Use the add_numbers tool to add 7 and 4.") {
+		if m, ok := msg.(ResultMessage); ok {
+			t.Logf("Result: status=%s", m.Status)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.True(t, asked, "expected a permission request for the mcp__ tool")
+	assert.Contains(t, askedTool, "add_numbers")
+
+	if gotProv == nil {
+		// Pre-v2.1.278 CLIs do not send the field. Absent is a valid wire
+		// state, so this is a skip rather than a failure — but it must not be
+		// silently read as "not an SDK server".
+		t.Skip("CLI predates mcp_server on the permission request")
+	}
+	assert.Equal(t, "calculator", gotProv.Name)
+	assert.Equal(t, MCPServerSourceSDK, gotProv.Source)
+	assert.True(t, gotProv.IsSDK())
+}
+
+// TestIntegrationMCPServerProvenanceHook asserts the CLI reports MCP server
+// provenance on a PreToolUse hook for an mcp__* tool (sdk.d.ts v0.3.278
+// L2644).
+func TestIntegrationMCPServerProvenanceHook(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	type AddArgs struct {
+		A int `json:"a"`
+		B int `json:"b"`
+	}
+
+	server := CreateMcpServer(McpServerOptions{
+		Name:    "calculator",
+		Version: "1.0.0",
+		Tools: []ToolRegistrar{
+			ToolWithSchema("add_numbers", "Add two numbers together and return the sum",
+				map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"a": map[string]interface{}{"type": "integer"},
+						"b": map[string]interface{}{"type": "integer"},
+					},
+					"required": []string{"a", "b"},
+				},
+				func(ctx context.Context, args AddArgs) (ToolResult, error) {
+					return TextResult(fmt.Sprintf("%d", args.A+args.B)), nil
+				},
+			),
+		},
+	})
+
+	var (
+		mu      sync.Mutex
+		fired   bool
+		gotProv *MCPServerProvenance
+	)
+
+	opts := append(isolatedClientOptions(t),
+		WithSystemPrompt(
+			"You are a helpful assistant. When asked to add numbers, "+
+				"you MUST use the add_numbers tool. Do not calculate manually.",
+		),
+		WithMcpServer("calculator", server),
+		WithPermissionMode(PermissionModeBypassAll),
+		WithAllowDangerouslySkipPermissions(true),
+		WithHooks(map[HookType][]HookConfig{
+			HookTypePreToolUse: {{Matcher: "*", Callback: func(
+				ctx context.Context, input HookInput,
+			) (HookResult, error) {
+				in, ok := input.(PreToolUseInput)
+				if !ok || !strings.HasPrefix(in.ToolName, "mcp__") {
+					return HookResult{Continue: true}, nil
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				fired = true
+				gotProv = in.MCPServer
+				t.Logf("PreToolUse %s, mcp_server=%+v", in.ToolName, in.MCPServer)
+				return HookResult{Continue: true}, nil
+			}}},
+		}),
+		WithMaxTurns(5),
+		WithStderr(func(data string) { t.Logf("CLI stderr: %s", data) }),
+	)
+
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	for msg := range client.Query(ctx, "Use the add_numbers tool to add 7 and 4.") {
+		if m, ok := msg.(ResultMessage); ok {
+			t.Logf("Result: status=%s", m.Status)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.True(t, fired, "expected a PreToolUse hook for the mcp__ tool")
+
+	if gotProv == nil {
+		t.Skip("CLI predates mcp_server on the PreToolUse hook input")
+	}
+	assert.Equal(t, "calculator", gotProv.Name)
+	assert.Equal(t, MCPServerSourceSDK, gotProv.Source)
+	assert.True(t, gotProv.IsSDK())
+}
+
+// TestIntegrationMCPServerProvenanceStatus asserts mcp_status reports where
+// each server came from (sdk.d.ts v0.3.278 L1197).
+//
+// It drives a stdio server rather than an in-process one on purpose: against
+// the CLI installed here, mcp_status returns an empty list for SDK-registered
+// servers, so an in-process fixture gives nothing to assert against either
+// way. A configured server is also the case with a trust answer worth pinning,
+// since "not sdk" is the verdict a host must reach for anything it did not
+// register itself.
+func TestIntegrationMCPServerProvenanceStatus(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	mcpServerPath := filepath.Join(t.TempDir(), "example-mcp-server")
+	buildCmd := exec.Command("go", "build", "-o", mcpServerPath, "./cmd/example-mcp-server")
+	buildCmd.Dir = "."
+	out, err := buildCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to build MCP server: %v\n%s", err, out)
+	}
+
+	opts := append(isolatedClientOptions(t),
+		WithMCPServers(map[string]MCPServerConfig{
+			"example": {
+				Type:    "stdio",
+				Command: mcpServerPath,
+			},
+		}),
+		WithStrictMCPConfig(true),
+		WithPermissionMode(PermissionModeBypassAll),
+		WithAllowDangerouslySkipPermissions(true),
+		WithStderr(func(data string) { t.Logf("CLI stderr: %s", data) }),
+	)
+
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	stream, err := client.Stream(ctx)
+	require.NoError(t, err)
+
+	statuses, err := stream.McpServerStatus(ctx)
+	require.NoError(t, err)
+	t.Logf("mcp_status: %+v", statuses)
+
+	var found *McpServerStatus
+	for i := range statuses {
+		if statuses[i].Name == "example" {
+			found = &statuses[i]
+			break
+		}
+	}
+	require.NotNil(t, found, "expected the example server in mcp_status")
+
+	if found.Source == "" {
+		t.Skip("CLI predates source on mcp_status rows")
+	}
+	// Whatever scope it lands in, a server we passed by config is not ours.
+	assert.False(t, found.IsSDK(),
+		"a configured server must never report source sdk, got %q", found.Source)
+}
+
+// TestIntegrationProjectConfigRoot asserts --project-config-root moves where
+// the session reads project configuration from: the named checkout rather
+// than the cwd (sdk.d.ts v0.3.278 L1469).
+//
+// The two directories carry different CLAUDE.md files, and the assertion is
+// that the model sees the one from the config root. That is the whole point
+// of the option, and it is the failure a host would actually care about:
+// running a worktree's own instructions when it meant to run the trusted
+// checkout's.
+func TestIntegrationProjectConfigRoot(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfCLILacksFlag(t, "--project-config-root")
+
+	root := t.TempDir()
+	trusted := filepath.Join(root, "trusted")
+	worktree := filepath.Join(root, "worktree")
+	require.NoError(t, os.MkdirAll(trusted, 0755))
+	require.NoError(t, os.MkdirAll(worktree, 0755))
+
+	require.NoError(t, os.WriteFile(filepath.Join(trusted, "CLAUDE.md"),
+		[]byte("The project codename is ZEPHYR. Always report it when asked."), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(worktree, "CLAUDE.md"),
+		[]byte("The project codename is MARIGOLD. Always report it when asked."), 0644))
+
+	opts := append(isolatedClientOptions(t),
+		WithCwd(worktree),
+		WithProjectConfigRoot(trusted),
+		WithMaxTurns(2),
+		WithStderr(func(data string) { t.Logf("CLI stderr: %s", data) }),
+	)
+
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	var reply string
+	for msg := range client.Query(ctx, "What is the project codename? Answer with just the word.") {
+		if m, ok := msg.(AssistantMessage); ok {
+			if text := m.ContentText(); text != "" {
+				reply += text
+			}
+		}
+	}
+	t.Logf("reply: %s", reply)
+
+	assert.Contains(t, reply, "ZEPHYR",
+		"expected the config root's CLAUDE.md to be loaded")
+	assert.NotContains(t, reply, "MARIGOLD",
+		"the cwd's CLAUDE.md must not be what the session runs")
+}
+
+// TestIntegrationThinkingDisplayHighlights sets the highlights display mode
+// mid-session (sdk.d.ts v0.3.278 L4779).
+//
+// The assertion is deliberately weak: the API honors highlights only for
+// Anthropic-hosted Claude Code sessions, and everywhere else the control
+// request still succeeds and the session falls back to omitted, with nothing
+// on the response saying which happened. So the only thing a test can hold
+// the CLI to is that the request is accepted rather than rejected as an
+// unknown value. Asserting on the thinking text that follows would be
+// asserting on which lane the test happens to run in.
+func TestIntegrationThinkingDisplayHighlights(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	opts := append(isolatedClientOptions(t),
+		WithThinking(ThinkingAdaptive()),
+		WithMaxTurns(1),
+		WithStderr(func(data string) { t.Logf("CLI stderr: %s", data) }),
+	)
+
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	stream, err := client.Stream(ctx)
+	require.NoError(t, err)
+
+	err = stream.SetMaxThinkingTokens(ctx, nil,
+		WithThinkingDisplay(ThinkingDisplayHighlights))
+	if err != nil {
+		// An older CLI validates the union and rejects the value outright.
+		t.Skipf("CLI rejected the highlights display mode: %v", err)
+	}
+}
+
+// TestIntegrationStartupFailureReason drives a real startup failure and reads
+// the machine-readable cause off the zeroed result (sdk.d.ts v0.3.278 L5388).
+//
+// cwd_unavailable is the one cause on the list that can be provoked without
+// touching org policy, gateway state or the host OS: point the session at a
+// directory and delete it before connecting. The env var is required because
+// this is one of the failures that historically ended with stderr alone, and
+// the CLI only writes the result frame for those when the host asks for it.
+func TestIntegrationStartupFailureReason(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfCLIOlderThan(t, "2.1.278")
+
+	gone := filepath.Join(t.TempDir(), "deleted-before-connect")
+	require.NoError(t, os.MkdirAll(gone, 0755))
+	require.NoError(t, os.RemoveAll(gone))
+
+	opts := append(isolatedClientOptions(t),
+		WithCwd(gone),
+		WithEnv(map[string]string{"CLAUDE_CODE_STARTUP_FAILURE_RESULTS": "1"}),
+		WithMaxTurns(1),
+		WithStderr(func(data string) { t.Logf("CLI stderr: %s", data) }),
+	)
+
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	var result *ResultMessage
+	for msg := range client.Query(ctx, "say ok") {
+		if m, ok := msg.(ResultMessage); ok {
+			result = &m
+			t.Logf("result: subtype=%s reason=%q errors=%v",
+				m.Subtype, m.StartupFailureReason, m.Errors)
+		}
+	}
+
+	if result == nil {
+		t.Skip("CLI exited without writing a startup-failure result frame")
+	}
+	assert.Equal(t, StartupFailureCwdUnavailable, result.StartupFailureReason)
+	assert.NotEmpty(t, result.Errors,
+		"errors should carry the same text as stderr")
+}
+
+// TestIntegrationAssistantUsageReport drives /usage against the live CLI and
+// checks the structured sibling on the assistant message carrying the text.
+//
+// Two conditions gate the field rather than one: the CLI has to be new enough
+// to attach it, and the session has to be a claude.ai-subscriber one. So the
+// assertions are conditional on it being attached at all, the same way
+// TestIntegrationAssistantContextUsage handles /context.
+func TestIntegrationAssistantUsageReport(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	client, err := NewClient(isolatedClientOptions(t)...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	var report *UsageReport
+	for msg := range client.Query(ctx, "/usage") {
+		assistant, ok := msg.(AssistantMessage)
+		if !ok || assistant.UsageReport == nil {
+			continue
+		}
+		report = assistant.UsageReport
+		break
+	}
+
+	if report == nil {
+		t.Skip("CLI did not attach usage_report to the /usage result; " +
+			"needs a CLI at 2.1.278 or newer on a claude.ai-subscriber session")
+	}
+
+	// Session totals are always real when the report is present.
+	assert.GreaterOrEqual(t, report.Session.TotalCostUSD, 0.0)
+	assert.GreaterOrEqual(t, report.Session.TotalDurationMs, int64(0))
+
+	if report.RateLimits == nil {
+		t.Log("rate_limits null: no plan on this lane, or a token without " +
+			"the profile scope")
+		return
+	}
+
+	for _, row := range report.RateLimits.Limits {
+		// Kind and group are the server's taxonomy, but a row with neither
+		// cannot be classified or grouped by any client.
+		assert.NotEmpty(t, row.Kind, "row with no kind cannot be classified")
+		assert.NotEmpty(t, row.Group)
+		assert.GreaterOrEqual(t, row.Percent, 0.0)
+		assert.LessOrEqual(t, row.Percent, 100.0)
+	}
+
+	if extra := report.RateLimits.ExtraUsage; extra != nil {
+		// Minor units, so these are integers and never negative.
+		if extra.MonthlyLimit != nil {
+			assert.GreaterOrEqual(t, *extra.MonthlyLimit, int64(0))
+		}
+		if extra.UsedCredits != nil {
+			assert.GreaterOrEqual(t, *extra.UsedCredits, int64(0))
+		}
+	}
+}
+
+// TestIntegrationVerbatimPrompts asserts that with VerbatimPrompts the CLI
+// hands a slash-command-shaped prompt to the model as text instead of
+// dispatching it locally (sdk.d.ts v0.3.290 L1893).
+func TestIntegrationVerbatimPrompts(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+	skipIfCLIOlderThan(t, "2.1.248")
+
+	run := func(verbatim bool) ResultMessage {
+		opts := append(isolatedClientOptions(t),
+			WithSystemPrompt("Repeat the user's message back exactly."),
+			WithMaxTurns(1),
+			WithVerbatimPrompts(verbatim),
+		)
+		client, err := NewClient(opts...)
+		require.NoError(t, err)
+		defer client.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+
+		for msg := range client.Query(ctx, "/cost") {
+			if result, ok := msg.(ResultMessage); ok {
+				return result
+			}
+		}
+		t.Fatal("no result message")
+		return ResultMessage{}
+	}
+
+	control := run(false)
+	if control.LocalCommand == "" {
+		t.Skip("CLI did not dispatch /cost locally even without " +
+			"client_composed; nothing to contrast against")
+	}
+
+	verbatim := run(true)
+	assert.Empty(t, verbatim.LocalCommand,
+		"client_composed prompt must not dispatch a slash command")
+	assert.False(t, verbatim.IsError)
+	assert.NotEmpty(t, verbatim.Result,
+		"the prompt should reach the model as a normal turn")
+}
+
+// TestIntegrationGetTaskOutput starts a background Bash task and reads its
+// output tail with get_task_output while it runs (sdk.d.ts v0.3.290 L4211).
+func TestIntegrationGetTaskOutput(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	opts := append(isolatedClientOptions(t),
+		WithCwd(t.TempDir()),
+		WithSystemPrompt(
+			"When asked to run a shell command, use Bash immediately "+
+				"with exactly the parameters given and do not describe it.",
+		),
+		WithPermissionMode(PermissionModeBypassAll),
+		WithAllowDangerouslySkipPermissions(true),
+		WithMaxTurns(3),
+	)
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	stream, err := client.Stream(ctx)
+	require.NoError(t, err)
+	defer stream.Close()
+
+	require.NoError(t, stream.Send(ctx,
+		"Run this Bash command with run_in_background set to true: "+
+			"for i in 1 2 3; do echo tick-$i; done; sleep 20",
+	))
+
+	var got *SDKControlGetTaskOutputResponse
+	for msg := range stream.Messages() {
+		started, ok := msg.(TaskStartedMessage)
+		if !ok {
+			if _, done := msg.(ResultMessage); done && got == nil {
+				t.Skip("model did not start a background Bash task")
+			}
+			continue
+		}
+
+		// The command writes its output right away, but the file the CLI
+		// tails may lag the task_started frame by a beat.
+		deadline := time.Now().Add(20 * time.Second)
+		for time.Now().Before(deadline) {
+			got, err = stream.GetTaskOutput(ctx, started.TaskID)
+			if err != nil && strings.Contains(err.Error(), "get_task_output") {
+				t.Skipf("CLI does not support get_task_output: %v", err)
+			}
+			require.NoError(t, err)
+			if strings.Contains(got.Output, "tick-3") {
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		break
+	}
+
+	require.NotNil(t, got, "never saw task_started for the background task")
+	assert.Contains(t, got.Output, "tick-1\ntick-2\ntick-3")
+	assert.GreaterOrEqual(t, got.TotalBytes, int64(len(got.Output)))
+	assert.False(t, got.Truncated, "a few bytes of output is not truncated")
+}
+
+// TestIntegrationMCPToolUIMeta asserts mcp_status lists a configured
+// server's tools and passes through the MCP Apps ui metadata the example
+// server's show_greeting tool declares (sdk.d.ts v0.3.290 L1280).
+func TestIntegrationMCPToolUIMeta(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	mcpServerPath := filepath.Join(t.TempDir(), "example-mcp-server")
+	buildCmd := exec.Command("go", "build", "-o", mcpServerPath, "./cmd/example-mcp-server")
+	out, err := buildCmd.CombinedOutput()
+	require.NoError(t, err, "failed to build MCP server: %s", out)
+
+	opts := append(isolatedClientOptions(t),
+		WithMCPServers(map[string]MCPServerConfig{
+			"example": {Type: "stdio", Command: mcpServerPath},
+		}),
+		WithStrictMCPConfig(true),
+	)
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	stream, err := client.Stream(ctx)
+	require.NoError(t, err)
+	defer stream.Close()
+
+	// MCP startup is non-blocking, so the server may still be pending on the
+	// first poll.
+	var found *McpServerStatus
+	deadline := time.Now().Add(30 * time.Second)
+	for found == nil && time.Now().Before(deadline) {
+		statuses, err := stream.McpServerStatus(ctx)
+		require.NoError(t, err)
+		for i := range statuses {
+			s := statuses[i]
+			if s.Name == "example" && s.Status == McpServerStateConnected {
+				found = &s
+			}
+		}
+		if found == nil {
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+	require.NotNil(t, found, "example server never connected")
+
+	var greeting *McpServerStatusTool
+	for i := range found.Tools {
+		if found.Tools[i].Name == "show_greeting" {
+			greeting = &found.Tools[i]
+		}
+	}
+	require.NotNil(t, greeting, "tools: %+v", found.Tools)
+
+	if greeting.Meta == nil {
+		t.Skip("CLI predates mcp_tool_ui_meta_v1")
+	}
+	assert.Equal(t, "ui://example/greeting.html", greeting.UIResourceURI())
+}
+
+// TestIntegrationReadMcpResource reads the example server's MCP Apps widget
+// through mcp_read_resource, and checks the CLI refuses a non-ui:// URI
+// (sdk.d.ts v0.3.290 L3178).
+func TestIntegrationReadMcpResource(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	mcpServerPath := filepath.Join(t.TempDir(), "example-mcp-server")
+	buildCmd := exec.Command("go", "build", "-o", mcpServerPath, "./cmd/example-mcp-server")
+	out, err := buildCmd.CombinedOutput()
+	require.NoError(t, err, "failed to build MCP server: %s", out)
+
+	opts := append(isolatedClientOptions(t),
+		WithMCPServers(map[string]MCPServerConfig{
+			"example": {Type: "stdio", Command: mcpServerPath},
+		}),
+		WithStrictMCPConfig(true),
+	)
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	stream, err := client.Stream(ctx)
+	require.NoError(t, err)
+	defer stream.Close()
+
+	const uri = "ui://example/greeting.html"
+
+	// MCP startup is non-blocking; a read before the server connects is
+	// refused as not connected, so retry until it lands.
+	var got *SDKControlMcpReadResourceResponse
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		got, err = stream.ReadMcpResource(ctx, "example", uri)
+		if err != nil && strings.Contains(err.Error(), "Unsupported control request") {
+			t.Skipf("CLI does not support mcp_read_resource: %v", err)
+		}
+		if err == nil {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	require.NoError(t, err)
+
+	require.Len(t, got.Contents, 1)
+	assert.Equal(t, uri, got.Contents[0].URI)
+	assert.Contains(t, got.Contents[0].Text, "Hello from example-mcp-server")
+	assert.Contains(t, got.Contents[0].MimeType, "text/html")
+	assert.Contains(t, got.Contents[0].Meta, "ui",
+		"the item's own _meta passes through")
+
+	_, err = stream.ReadMcpResource(ctx, "example", "file:///etc/passwd")
+	assert.Error(t, err, "a non-ui:// URI must be refused")
+}
+
+// TestIntegrationConversationResetTrigger runs /clear in a streaming session
+// and checks the conversation_reset frame names it (sdk.d.ts v0.3.290
+// L5132).
+func TestIntegrationConversationResetTrigger(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	client, err := NewClient(isolatedClientOptions(t)...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	stream, err := client.Stream(ctx)
+	require.NoError(t, err)
+	defer stream.Close()
+
+	require.NoError(t, stream.Send(ctx, "/clear"))
+
+	var reset *ConversationResetMessage
+	for msg := range stream.Messages() {
+		if m, ok := msg.(ConversationResetMessage); ok {
+			reset = &m
+			break
+		}
+		if _, ok := msg.(ResultMessage); ok {
+			break
+		}
+	}
+	if reset == nil {
+		t.Skip("CLI did not emit conversation_reset for /clear on this lane")
+	}
+
+	assert.NotEmpty(t, reset.NewConversationID)
+	if reset.Trigger == "" {
+		t.Skip("CLI predates conversation_reset trigger")
+	}
+	assert.Equal(t, ConversationResetTriggerClear, reset.Trigger)
+	assert.NotEmpty(t, reset.Timestamp)
+	// We sent no uuid of our own, so this is the one the CLI assigned to the
+	// typed /clear.
+	assert.NotEmpty(t, reset.UserMessageUUID)
+}
+
+// TestIntegrationInitPluginErrors configures one loadable plugin and one
+// missing plugin directory, and checks the init message reports the second
+// under plugin_errors with its path (sdk.d.ts v0.3.290 L5958).
+func TestIntegrationInitPluginErrors(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	const pluginName = "daedalus-probe"
+	goodDir := writeProbePlugin(t, pluginName)
+	missingDir := filepath.Join(t.TempDir(), "no-such-plugin")
+
+	opts := append(isolatedClientOptions(t),
+		WithSystemPrompt("You are a helpful assistant. Be very brief."),
+		WithPlugins([]PluginConfig{
+			{Type: PluginTypeLocal, Path: goodDir},
+			{Type: PluginTypeLocal, Path: missingDir},
+		}),
+		WithMaxTurns(1),
+	)
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	var init *SystemMessage
+	for msg := range client.Query(ctx, "Say OK.") {
+		if m, ok := msg.(SystemMessage); ok && m.Subtype == "init" {
+			init = &m
+			break
+		}
+	}
+	require.NotNil(t, init, "no init message")
+
+	var probe *SystemPlugin
+	for i := range init.Plugins {
+		if init.Plugins[i].Name == pluginName {
+			probe = &init.Plugins[i]
+		}
+	}
+	require.NotNil(t, probe, "probe plugin did not load: %+v", init.Plugins)
+	assert.Equal(t, "0.0.1", probe.Version)
+
+	if len(init.PluginErrors) == 0 {
+		t.Skip("CLI predates plugin_errors on init")
+	}
+	var found bool
+	for _, e := range init.PluginErrors {
+		t.Logf("plugin_error: %+v", e)
+		if e.Path == missingDir {
+			found = true
+			assert.NotEmpty(t, e.Type)
+			assert.NotEmpty(t, e.Message)
+		}
+	}
+	assert.True(t, found, "no plugin_errors entry for %s", missingDir)
+}
+
+// TestIntegrationInitViewMode checks the per-turn init frame of a headless
+// stream-json session reports the transcript view (sdk.d.ts v0.3.290 L5982).
+// Only the default is reachable here: a headless session answers /focus with
+// "isn't available here yet", so the focus value is covered by the unit test.
+func TestIntegrationInitViewMode(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	opts := append(isolatedClientOptions(t),
+		WithSystemPrompt("You are a helpful assistant. Be very brief."),
+		WithMaxTurns(1),
+	)
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	var init *SystemMessage
+	for msg := range client.Query(ctx, "Say OK.") {
+		if m, ok := msg.(SystemMessage); ok && m.Subtype == "init" {
+			init = &m
+			break
+		}
+	}
+	require.NotNil(t, init, "no init message")
+
+	if init.ViewMode == "" {
+		t.Skip("CLI predates view_mode on init")
+	}
+	assert.Equal(t, ViewModeDefault, init.ViewMode)
+}
+
+// TestIntegrationSettingsParityV0_3_290 pushes the v0.3.290 settings through
+// the managed tier and completes a turn. allowedProviders names the provider
+// this session actually uses, so a correctly-shaped list must let it start;
+// the per-model autoCompactWindow exercises both arms of its union.
+func TestIntegrationSettingsParityV0_3_290(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	width := 100
+	idle := false
+	chrome := false
+	opts := append(isolatedClientOptions(t),
+		WithSystemPrompt("You are a helpful assistant. Be very brief."),
+		WithManagedSettings(Settings{
+			AvailableModelsMatch:              AvailableModelsMatchExact,
+			DeniedModels:                      []string{"claude-3-opus"},
+			AllowClaudeInChromeWithManagedMcp: &chrome,
+			AllowedProviders: []AllowedProvider{
+				AllowedProviderAnthropic,
+			},
+			MaxProseWidth:  &width,
+			IdleCompaction: &idle,
+			ModelSettings: map[string]SettingsModel{
+				"claude-opus-5": {
+					AutoCompactWindow: &AutoCompactWindow{Auto: true},
+				},
+				"claude-sonnet-5": {
+					AutoCompactWindow: &AutoCompactWindow{Tokens: 400000},
+				},
+			},
+		}),
+		WithMaxTurns(1),
+	)
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	var gotResult bool
+	for msg := range client.Query(ctx, "Say OK.") {
+		if m, ok := msg.(ResultMessage); ok {
+			assert.False(t, m.IsError,
+				"the v0.3.290 settings must not fail the session: %s", m.Result)
+			gotResult = true
+			break
+		}
+	}
+	assert.True(t, gotResult,
+		"a stalled managed-settings handshake shows up as no result at all")
+}
+
+// TestIntegrationAllowedProvidersRefusesStartup sets an allowedProviders list
+// that leaves out the provider this session uses, and checks the CLI refuses
+// to start with the provider_not_allowed reason (sdk.d.ts v0.3.290 L8610,
+// L5896).
+//
+// The CLI writes the frame, but the Go client currently drops a result that
+// arrives before the initialize reply and then waits out ctx (#289), so this
+// skips until that lands. The short timeout keeps the skip cheap.
+func TestIntegrationAllowedProvidersRefusesStartup(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	opts := append(isolatedClientOptions(t),
+		WithManagedSettings(Settings{
+			AllowedProviders: []AllowedProvider{AllowedProviderBedrock},
+		}),
+		WithEnv(map[string]string{"CLAUDE_CODE_STARTUP_FAILURE_RESULTS": "1"}),
+		WithMaxTurns(1),
+	)
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var result *ResultMessage
+	for msg := range client.Query(ctx, "say ok") {
+		if m, ok := msg.(ResultMessage); ok {
+			result = &m
+		}
+	}
+
+	if result == nil {
+		t.Skip("startup-failure result frame not surfaced by the client (#289)")
+	}
+	if result.StartupFailureReason == "" && !result.IsError {
+		t.Skip("CLI predates allowedProviders and started normally")
+	}
+	assert.Equal(t, StartupFailureProviderNotAllowed, result.StartupFailureReason)
+}
+
+// TestIntegrationSettingsHookOnFailureBlock registers a PreToolUse command
+// hook that always exits 1 with onFailure "block" and checks the Bash call it
+// guards is refused. Without the key an exit 1 is a non-blocking failure and
+// the command runs, which is what CLIs before 2.1.296 still do
+// (sdk.d.ts v0.3.296 L7101).
+func TestIntegrationSettingsHookOnFailureBlock(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+	skipIfCLIOlderThan(t, "2.1.296")
+
+	opts := append(isolatedClientOptions(t),
+		WithCwd(t.TempDir()),
+		WithSettings(Settings{
+			Hooks: map[string][]SettingsHookMatcher{
+				"PreToolUse": {{
+					Matcher: "Bash",
+					Hooks: []SettingsHook{{
+						Type:      "command",
+						Command:   "exit 1",
+						OnFailure: SettingsHookOnFailureBlock,
+					}},
+				}},
+			},
+		}),
+		WithPermissionMode(PermissionModeBypassAll),
+		WithAllowDangerouslySkipPermissions(true),
+		WithMaxTurns(2),
+	)
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	stream, err := client.Stream(ctx)
+	require.NoError(t, err)
+	defer stream.Close()
+
+	require.NoError(t, stream.Send(ctx, "Run the Bash command: echo $((6*7))"))
+
+	var toolResults []string
+	for msg := range stream.Messages() {
+		switch m := msg.(type) {
+		case UserMessage:
+			if m.ToolUseResult != nil {
+				toolResults = append(toolResults,
+					fmt.Sprint(m.ToolUseResult))
+			}
+		case ResultMessage:
+			cancel()
+		}
+	}
+
+	require.NotEmpty(t, toolResults, "expected the Bash call to be attempted")
+	assert.Contains(t, toolResults[0], "onFailure",
+		"the failing hook must block the call it guards")
+	assert.NotContains(t, toolResults[0], "42",
+		"the blocked command must not have run")
+}
+
+// TestIntegrationSettingsAttributionFalse sends attribution as a bare false
+// through --settings and reads the effective settings back: the CLI expands
+// it to the hide-everything object form (sdk.d.ts v0.3.290 L6773). The Go
+// SDK has no get_settings wrapper yet, so this goes through the raw control
+// request.
+func TestIntegrationSettingsAttributionFalse(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	opts := append(isolatedClientOptions(t),
+		WithSettings(Settings{
+			Attribution: &SettingsAttribution{HideAll: true},
+		}),
+	)
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	stream, err := client.Stream(ctx)
+	require.NoError(t, err)
+	defer stream.Close()
+
+	resp, err := stream.sendSDKControlRequest(ctx, SDKControlRequestBody{
+		Subtype: "get_settings",
+	})
+	require.NoError(t, err)
+
+	raw, err := json.Marshal(resp.Response.Response)
+	require.NoError(t, err)
+	var got struct {
+		Effective Settings `json:"effective"`
+		Errors    []struct {
+			Path    string `json:"path"`
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &got))
+
+	for _, e := range got.Errors {
+		assert.NotEqual(t, "attribution", e.Path,
+			"CLI rejected the boolean form: %s", e.Message)
+	}
+	require.NotNil(t, got.Effective.Attribution)
+	attr := *got.Effective.Attribution
+	require.NotNil(t, attr.Commit)
+	require.NotNil(t, attr.PR)
+	require.NotNil(t, attr.SessionURL)
+	assert.Empty(t, *attr.Commit)
+	assert.Empty(t, *attr.PR)
+	assert.False(t, *attr.SessionURL)
+}
+
+// TestIntegrationSetMaxThinkingTokensReset sets a budget and then resets it
+// with nil, which must reach the CLI as an explicit null (sdk.d.ts v0.3.290
+// L5069). The budget itself isn't observable from outside, so this pins that
+// the live CLI accepts both shapes.
+func TestIntegrationSetMaxThinkingTokensReset(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	client, err := NewClient(isolatedClientOptions(t)...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	stream, err := client.Stream(ctx)
+	require.NoError(t, err)
+	defer stream.Close()
+
+	budget := 5000
+	require.NoError(t, stream.SetMaxThinkingTokens(ctx, &budget))
+	require.NoError(t, stream.SetMaxThinkingTokens(ctx, nil))
+}
+
+// TestIntegrationStreamSendMessage drives SendMessage against the live CLI:
+// pasted_content has to reach the model (the answer only exists in the
+// paste), and a per-message client_composed has to stop slash-command
+// dispatch without VerbatimPrompts being set.
+func TestIntegrationStreamSendMessage(t *testing.T) {
+	skipIfNoToken(t)
+	skipIfNoCLI(t)
+
+	opts := append(isolatedClientOptions(t),
+		WithSystemPrompt("You are a helpful assistant. Be very brief."),
+	)
+	client, err := NewClient(opts...)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	stream, err := client.Stream(ctx)
+	require.NoError(t, err)
+	defer stream.Close()
+
+	next, stop := iter.Pull(stream.Messages())
+	defer stop()
+	result := func() ResultMessage {
+		for {
+			msg, ok := next()
+			require.True(t, ok, "stream ended before a result")
+			if r, ok := msg.(ResultMessage); ok {
+				return r
+			}
+		}
+	}
+
+	require.NoError(t, stream.SendMessage(ctx, UserMessage{
+		Message: APIUserMessage{Content: []UserContentBlock{{
+			Type: "text",
+			Text: "Reply with only the code word from the pasted text.",
+		}}},
+		PastedContent: []PastedContentEntry{
+			{Text: "The code word is PERIWINKLE."},
+		},
+	}))
+	pasted := result()
+	require.False(t, pasted.IsError, pasted.Result)
+	assert.Contains(t, strings.ToUpper(pasted.Result), "PERIWINKLE",
+		"pasted_content never reached the model")
+
+	require.NoError(t, stream.SendMessage(ctx, UserMessage{
+		Message: APIUserMessage{Content: []UserContentBlock{{
+			Type: "text", Text: "/cost",
+		}}},
+		ClientComposed: true,
+	}))
+	composed := result()
+	assert.Empty(t, composed.LocalCommand,
+		"a client_composed message must not dispatch a slash command")
 }

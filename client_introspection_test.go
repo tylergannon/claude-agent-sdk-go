@@ -643,3 +643,624 @@ func TestStreamGetUsageSkipBehaviorsWireShape(t *testing.T) {
 		)
 	})
 }
+
+// TestContextUsageCategoryKind covers the v0.3.270 kind discriminator on
+// get_context_usage rows. The doc is explicit that consumers must classify on
+// it rather than on the English name, which the CLI is free to reword.
+func TestContextUsageCategoryKind(t *testing.T) {
+	t.Run("every row kind parses", func(t *testing.T) {
+		raw := `{
+			"categories": [
+				{"name": "Messages", "tokens": 12000, "color": "blue", "kind": "used"},
+				{"name": "Free space", "tokens": 80000, "color": "gray", "kind": "free"},
+				{"name": "Autocompact buffer", "tokens": 8000, "color": "amber", "kind": "buffer"},
+				{"name": "MCP tools (deferred)", "tokens": 4000, "color": "dim",
+				 "isDeferred": true, "kind": "deferred"}
+			],
+			"totalTokens": 104000,
+			"maxTokens": 200000,
+			"rawMaxTokens": 200000,
+			"percentage": 52
+		}`
+		var out SDKControlGetContextUsageResponse
+		require.NoError(t, json.Unmarshal([]byte(raw), &out))
+		require.Len(t, out.Categories, 4)
+
+		assert.Equal(t, ContextUsageUsed, out.Categories[0].Kind)
+		assert.Equal(t, ContextUsageFree, out.Categories[1].Kind)
+		assert.Equal(t, ContextUsageBuffer, out.Categories[2].Kind)
+		assert.Equal(t, ContextUsageDeferred, out.Categories[3].Kind)
+
+		// The deferred row is the one place the old IsDeferred signal and
+		// the new Kind overlap; they must agree.
+		assert.True(t, out.Categories[3].IsDeferred)
+	})
+
+	t.Run("older CLI omits kind", func(t *testing.T) {
+		raw := `{
+			"categories": [{"name": "Messages", "tokens": 1, "color": "blue"}],
+			"totalTokens": 1, "maxTokens": 2, "rawMaxTokens": 2, "percentage": 50
+		}`
+		var out SDKControlGetContextUsageResponse
+		require.NoError(t, json.Unmarshal([]byte(raw), &out))
+		require.Len(t, out.Categories, 1)
+		assert.Empty(t, out.Categories[0].Kind)
+	})
+}
+
+// TestStreamListPermissionRules covers the v0.3.270 list_permission_rules
+// control request: the wire shape it sends, and the state it parses back.
+func TestStreamListPermissionRules(t *testing.T) {
+	t.Run("request wire shape", func(t *testing.T) {
+		stream, transport, _ := newStreamControlTest(
+			successSDKControlResponseWithPayload(map[string]interface{}{
+				"state": map[string]interface{}{
+					"rules":                []interface{}{},
+					"workspaceDirectories": []interface{}{},
+					"originalCwd":          "/repo",
+					"managedOnly":          false,
+				},
+			}),
+		)
+
+		err := callWithTimeout(t, func(ctx context.Context) error {
+			_, err := stream.ListPermissionRules(ctx)
+			return err
+		})
+		require.NoError(t, err)
+
+		assert.JSONEq(t,
+			`{"type":"control_request","request_id":"req_1","request":{"subtype":"list_permission_rules"}}`,
+			rawWrittenSDKControlRequest(t, transport),
+		)
+	})
+
+	t.Run("parses rules, directories and provenance", func(t *testing.T) {
+		stream, _, _ := newStreamControlTest(
+			successSDKControlResponseWithPayload(map[string]interface{}{
+				"state": map[string]interface{}{
+					"rules": []interface{}{
+						map[string]interface{}{
+							"behavior": "allow",
+							"source":   "userSettings",
+							"rule":     "Bash(npm run:*)",
+							"description": map[string]interface{}{
+								"prefix":   "Any Bash command starting with",
+								"emphasis": "npm run",
+							},
+							"editability": "persistent",
+						},
+						map[string]interface{}{
+							"behavior":    "deny",
+							"source":      "policySettings",
+							"rule":        "Read(//etc/**)",
+							"editability": "readonly",
+						},
+						map[string]interface{}{
+							"behavior":    "ask",
+							"source":      "cliArg",
+							"rule":        "WebFetch",
+							"editability": "session",
+						},
+					},
+					"workspaceDirectories": []interface{}{
+						map[string]interface{}{"path": "/repo", "source": "cliArg"},
+						map[string]interface{}{"path": "/scratch", "source": "session"},
+					},
+					"originalCwd": "/repo",
+					"managedOnly": false,
+				},
+			}),
+		)
+
+		var got *SDKControlPermissionRulesState
+		err := callWithTimeout(t, func(ctx context.Context) error {
+			var err error
+			got, err = stream.ListPermissionRules(ctx)
+			return err
+		})
+		require.NoError(t, err)
+		require.Len(t, got.Rules, 3)
+
+		assert.Equal(t, PermissionRuleBehaviorAllow, got.Rules[0].Behavior)
+		assert.Equal(t, PermissionRuleSourceUserSettings, got.Rules[0].Source)
+		assert.Equal(t, "Bash(npm run:*)", got.Rules[0].Rule)
+		assert.Equal(t, PermissionRuleEditabilityPersistent, got.Rules[0].Editability)
+		require.NotNil(t, got.Rules[0].Description)
+		assert.Equal(t, "Any Bash command starting with", got.Rules[0].Description.Prefix)
+		assert.Equal(t, "npm run", got.Rules[0].Description.Emphasis)
+		assert.Empty(t, got.Rules[0].Description.Suffix)
+
+		assert.Equal(t, PermissionRuleBehaviorDeny, got.Rules[1].Behavior)
+		assert.Equal(t, PermissionRuleEditabilityReadonly, got.Rules[1].Editability)
+		assert.Nil(t, got.Rules[1].Description,
+			"no subtitle in the terminal means no description on the wire")
+
+		assert.Equal(t, PermissionRuleBehaviorAsk, got.Rules[2].Behavior)
+		assert.Equal(t, PermissionRuleEditabilitySession, got.Rules[2].Editability)
+
+		require.Len(t, got.WorkspaceDirectories, 2)
+		assert.Equal(t, "/scratch", got.WorkspaceDirectories[1].Path)
+		assert.Equal(t, "session", got.WorkspaceDirectories[1].Source)
+		assert.Equal(t, "/repo", got.OriginalCwd)
+	})
+
+	t.Run("rules are verbatim, not normalized", func(t *testing.T) {
+		// Two spellings that parse identically each get their own entry, and
+		// a rule may carry invisible characters by design. Both are why a
+		// host must escape at display rather than trust the string.
+		hidden := "Bash(rm\u200b -rf)"
+		stream, _, _ := newStreamControlTest(
+			successSDKControlResponseWithPayload(map[string]interface{}{
+				"state": map[string]interface{}{
+					"rules": []interface{}{
+						map[string]interface{}{
+							"behavior": "allow", "source": "userSettings",
+							"rule": "Bash(ls)", "editability": "persistent",
+						},
+						map[string]interface{}{
+							"behavior": "allow", "source": "projectSettings",
+							"rule": "Bash(ls:*)", "editability": "persistent",
+						},
+						map[string]interface{}{
+							"behavior": "deny", "source": "session",
+							"rule": hidden, "editability": "session",
+						},
+					},
+					"workspaceDirectories": []interface{}{},
+					"originalCwd":          "/repo",
+					"managedOnly":          false,
+				},
+			}),
+		)
+
+		var got *SDKControlPermissionRulesState
+		err := callWithTimeout(t, func(ctx context.Context) error {
+			var err error
+			got, err = stream.ListPermissionRules(ctx)
+			return err
+		})
+		require.NoError(t, err)
+		require.Len(t, got.Rules, 3)
+		assert.Equal(t, "Bash(ls)", got.Rules[0].Rule)
+		assert.Equal(t, "Bash(ls:*)", got.Rules[1].Rule,
+			"identically-parsing spellings are separate entries, not deduplicated")
+		assert.Equal(t, hidden, got.Rules[2].Rule,
+			"invisible characters survive the round trip untouched")
+	})
+
+	t.Run("managed-only marks other sources not in effect", func(t *testing.T) {
+		stream, _, _ := newStreamControlTest(
+			successSDKControlResponseWithPayload(map[string]interface{}{
+				"state": map[string]interface{}{
+					"rules": []interface{}{
+						map[string]interface{}{
+							"behavior": "allow", "source": "policySettings",
+							"rule": "Bash(git status)", "editability": "readonly",
+						},
+						map[string]interface{}{
+							"behavior": "allow", "source": "userSettings",
+							"rule": "Bash(curl:*)", "editability": "readonly",
+							"notInEffect": true,
+						},
+					},
+					"workspaceDirectories": []interface{}{},
+					"originalCwd":          "/repo",
+					"managedOnly":          true,
+					"errors": []interface{}{
+						map[string]interface{}{
+							"file":    "/repo/.claude/settings.json",
+							"path":    "permissions.allow",
+							"message": "expected array",
+						},
+					},
+				},
+			}),
+		)
+
+		var got *SDKControlPermissionRulesState
+		err := callWithTimeout(t, func(ctx context.Context) error {
+			var err error
+			got, err = stream.ListPermissionRules(ctx)
+			return err
+		})
+		require.NoError(t, err)
+		assert.True(t, got.ManagedOnly)
+		require.Len(t, got.Rules, 2)
+		assert.False(t, got.Rules[0].NotInEffect, "the policy rule is the one that applies")
+		assert.True(t, got.Rules[1].NotInEffect)
+		assert.Equal(t, PermissionRuleEditabilityReadonly, got.Rules[1].Editability,
+			"a not-in-effect row is always readonly")
+
+		require.Len(t, got.Errors, 1)
+		assert.Equal(t, "/repo/.claude/settings.json", got.Errors[0].File)
+		assert.Equal(t, "permissions.allow", got.Errors[0].Path)
+		assert.Equal(t, "expected array", got.Errors[0].Message)
+	})
+
+	t.Run("error", func(t *testing.T) {
+		stream, _, _ := newStreamControlTest(
+			controlErrorResponse("unknown subtype list_permission_rules"))
+
+		err := callWithTimeout(t, func(ctx context.Context) error {
+			_, err := stream.ListPermissionRules(ctx)
+			return err
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unknown subtype")
+	})
+}
+
+func TestStreamGetHooksListing(t *testing.T) {
+	t.Run("request wire shape", func(t *testing.T) {
+		stream, transport, _ := newStreamControlTest(
+			successSDKControlResponseWithPayload(map[string]interface{}{
+				"events":       []interface{}{},
+				"hooks":        []interface{}{},
+				"eventCatalog": []interface{}{},
+				"policy": map[string]interface{}{
+					"disabledByPolicy": false,
+					"managedOnly":      false,
+					"pluginOnly":       false,
+					"allDisabled":      false,
+					"policyHookCount":  0,
+				},
+			}),
+		)
+
+		err := callWithTimeout(t, func(ctx context.Context) error {
+			_, err := stream.GetHooksListing(ctx)
+			return err
+		})
+		require.NoError(t, err)
+
+		assert.JSONEq(t,
+			`{"type":"control_request","request_id":"req_1","request":{"subtype":"get_hooks_listing"}}`,
+			rawWrittenSDKControlRequest(t, transport),
+		)
+	})
+
+	t.Run("parses events, hooks, editable and policy", func(t *testing.T) {
+		stream, _, _ := newStreamControlTest(
+			successSDKControlResponseWithPayload(map[string]interface{}{
+				"events": []interface{}{
+					map[string]interface{}{
+						"name":            "PreToolUse",
+						"summary":         "before a tool runs",
+						"supportsMatcher": true,
+						"hookCount":       2,
+					},
+				},
+				"hooks": []interface{}{
+					map[string]interface{}{
+						"event":        "PreToolUse",
+						"matcher":      "Bash",
+						"source":       "userSettings",
+						"sourceLabel":  "User settings",
+						"type":         "command",
+						"displayText":  "guard.sh",
+						"commandText":  "./guard.sh",
+						"contentLabel": "Command",
+						"timeout":      30,
+						"editable": map[string]interface{}{
+							"matcher": "Bash",
+							"config": map[string]interface{}{
+								"type":    "command",
+								"command": "./guard.sh",
+							},
+						},
+					},
+					map[string]interface{}{
+						"event":        "PreToolUse",
+						"matcher":      "",
+						"source":       "pluginHook",
+						"sourceLabel":  "Plugin: sec-default",
+						"pluginName":   "sec-default",
+						"type":         "http",
+						"displayText":  "audit endpoint",
+						"commandText":  "https://audit.example/hook",
+						"contentLabel": "URL",
+						"disabled":     true,
+						"editable": map[string]interface{}{
+							"matcher":         "",
+							"config":          map[string]interface{}{"type": "http"},
+							"headersRedacted": true,
+						},
+					},
+				},
+				"eventCatalog": []interface{}{
+					map[string]interface{}{
+						"name":            "PreToolUse",
+						"summary":         "before a tool runs",
+						"supportsMatcher": true,
+					},
+					map[string]interface{}{
+						"name":            "SessionStart",
+						"summary":         "session begins",
+						"supportsMatcher": false,
+					},
+				},
+				"policy": map[string]interface{}{
+					"disabledByPolicy": false,
+					"managedOnly":      true,
+					"pluginOnly":       false,
+					"allDisabled":      false,
+					"policyHookCount":  1,
+				},
+				"safeMode": map[string]interface{}{
+					"managedHooksStillApply": true,
+					"exitHint":               "restart without --safe-mode",
+				},
+				"errors": []interface{}{
+					map[string]interface{}{
+						"file":    "/repo/.claude/settings.json",
+						"path":    "hooks",
+						"message": "expected object",
+					},
+				},
+			}),
+		)
+
+		var got *SDKControlGetHooksListingResponse
+		err := callWithTimeout(t, func(ctx context.Context) error {
+			var err error
+			got, err = stream.GetHooksListing(ctx)
+			return err
+		})
+		require.NoError(t, err)
+
+		require.Len(t, got.Events, 1)
+		assert.Equal(t, "PreToolUse", got.Events[0].Name)
+		assert.True(t, got.Events[0].SupportsMatcher)
+		assert.Equal(t, 2, got.Events[0].HookCount)
+
+		require.Len(t, got.Hooks, 2)
+		assert.Equal(t, "Bash", got.Hooks[0].Matcher)
+		assert.Equal(t, 30, got.Hooks[0].Timeout)
+		assert.False(t, got.Hooks[0].Disabled)
+		require.NotNil(t, got.Hooks[0].Editable)
+		assert.Equal(t, "./guard.sh", got.Hooks[0].Editable.Config["command"])
+		assert.False(t, got.Hooks[0].Editable.HeadersRedacted)
+
+		assert.Equal(t, "sec-default", got.Hooks[1].PluginName)
+		assert.True(t, got.Hooks[1].Disabled,
+			"a hook a policy blocks is listed with disabled set")
+		require.NotNil(t, got.Hooks[1].Editable)
+		assert.True(t, got.Hooks[1].Editable.HeadersRedacted)
+
+		require.Len(t, got.EventCatalog, 2)
+		assert.False(t, got.EventCatalog[1].SupportsMatcher)
+
+		assert.True(t, got.Policy.ManagedOnly)
+		assert.Equal(t, 1, got.Policy.PolicyHookCount)
+
+		require.NotNil(t, got.SafeMode)
+		assert.True(t, got.SafeMode.ManagedHooksStillApply)
+		assert.Nil(t, got.BareMode)
+
+		require.Len(t, got.Errors, 1)
+		assert.Equal(t, "hooks", got.Errors[0].Path)
+	})
+
+	t.Run("error", func(t *testing.T) {
+		stream, _, _ := newStreamControlTest(
+			controlErrorResponse("unknown subtype get_hooks_listing"))
+
+		err := callWithTimeout(t, func(ctx context.Context) error {
+			_, err := stream.GetHooksListing(ctx)
+			return err
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unknown subtype")
+	})
+}
+
+// TestSetMaxThinkingTokensHighlights covers the highlights display mode added
+// in TS SDK v0.3.278 (sdk.d.ts L2746 / L4779).
+func TestSetMaxThinkingTokensHighlights(t *testing.T) {
+	t.Run("rides the control request", func(t *testing.T) {
+		body := SDKControlRequestBody{
+			Subtype:         "set_max_thinking_tokens",
+			ThinkingDisplay: &ThinkingDisplayOverride{Mode: thinkingDisplayPtr(ThinkingDisplayHighlights)},
+		}
+
+		raw, err := json.Marshal(body)
+		require.NoError(t, err)
+
+		var got map[string]interface{}
+		require.NoError(t, json.Unmarshal(raw, &got))
+		assert.Equal(t, "highlights", got["thinking_display"])
+	})
+
+	t.Run("round-trips back off the wire", func(t *testing.T) {
+		var body SDKControlRequestBody
+		require.NoError(t, json.Unmarshal([]byte(
+			`{"subtype":"set_max_thinking_tokens","thinking_display":"highlights"}`,
+		), &body))
+
+		require.NotNil(t, body.ThinkingDisplay)
+		require.NotNil(t, body.ThinkingDisplay.Mode)
+		assert.Equal(t, ThinkingDisplayHighlights, *body.ThinkingDisplay.Mode)
+	})
+
+	// The option constructor is the only supported way to reach it.
+	t.Run("WithThinkingDisplay carries it", func(t *testing.T) {
+		var cfg setMaxThinkingTokensOptions
+		WithThinkingDisplay(ThinkingDisplayHighlights)(&cfg)
+
+		require.NotNil(t, cfg.display)
+		require.NotNil(t, cfg.display.Mode)
+		assert.Equal(t, ThinkingDisplayHighlights, *cfg.display.Mode)
+	})
+
+	// The spawn-time flag union does not include highlights, so this pins the
+	// asymmetry rather than the behavior: if a future CLI starts accepting it
+	// at spawn time, this is the test that should change.
+	t.Run("spawn-time flag union excludes it", func(t *testing.T) {
+		runner := NewMockSubprocessRunner()
+		opts := &Options{
+			Thinking: &ThinkingConfig{
+				Type:    "adaptive",
+				Display: ThinkingDisplaySummarized,
+			},
+		}
+		transport := NewSubprocessTransportWithRunner(runner, opts)
+		require.NoError(t, transport.Connect(context.Background()))
+		defer transport.Close()
+
+		assert.Contains(t, runner.StartArgs, "--thinking-display=summarized")
+		assert.NotContains(t, runner.StartArgs, "highlights")
+	})
+}
+
+func thinkingDisplayPtr(d ThinkingDisplay) *ThinkingDisplay { return &d }
+
+// TestUpdateSettingsSources covers the userSettings source v0.3.278 adds
+// alongside localSettings (sdk.d.ts L4812-4822).
+func TestUpdateSettingsSources(t *testing.T) {
+	t.Run("constants match the wire values", func(t *testing.T) {
+		assert.Equal(t, SettingsSource("localSettings"), SettingsSourceLocal)
+		assert.Equal(t, SettingsSource("userSettings"), SettingsSourceUser)
+	})
+
+	// Each source carries its own allowlisted key, so both shapes need to
+	// survive the marshal the way the CLI expects to read them.
+	for _, tc := range []struct {
+		name     string
+		source   SettingsSource
+		settings map[string]interface{}
+		wantKey  string
+	}{
+		{
+			name:     "localSettings writes outputStyle",
+			source:   SettingsSourceLocal,
+			settings: map[string]interface{}{"outputStyle": "Explanatory"},
+			wantKey:  "outputStyle",
+		},
+		{
+			name:     "userSettings writes effortLevel",
+			source:   SettingsSourceUser,
+			settings: map[string]interface{}{"effortLevel": "high"},
+			wantKey:  "effortLevel",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := SDKControlRequestBody{
+				Subtype:        "update_settings",
+				SettingsSource: string(tc.source),
+				Settings:       &tc.settings,
+			}
+
+			raw, err := json.Marshal(body)
+			require.NoError(t, err)
+
+			var got map[string]interface{}
+			require.NoError(t, json.Unmarshal(raw, &got))
+
+			assert.Equal(t, string(tc.source), got["source"])
+			settings, ok := got["settings"].(map[string]interface{})
+			require.True(t, ok)
+			assert.Contains(t, settings, tc.wantKey)
+		})
+	}
+}
+
+func TestStreamGetTaskOutput(t *testing.T) {
+	t.Run("request wire shape and parse", func(t *testing.T) {
+		stream, transport, _ := newStreamControlTest(
+			successSDKControlResponseWithPayload(map[string]interface{}{
+				"output":      "line 2\nline 3\n",
+				"total_bytes": 20000,
+				"truncated":   true,
+			}),
+		)
+
+		var got *SDKControlGetTaskOutputResponse
+		err := callWithTimeout(t, func(ctx context.Context) error {
+			var err error
+			got, err = stream.GetTaskOutput(ctx, "bash_1")
+			return err
+		})
+		require.NoError(t, err)
+
+		assert.JSONEq(t,
+			`{"type":"control_request","request_id":"req_1","request":{"subtype":"get_task_output","task_id":"bash_1"}}`,
+			rawWrittenSDKControlRequest(t, transport),
+		)
+		assert.Equal(t, "line 2\nline 3\n", got.Output)
+		assert.Equal(t, int64(20000), got.TotalBytes)
+		assert.True(t, got.Truncated)
+	})
+
+	t.Run("error", func(t *testing.T) {
+		stream, _, _ := newStreamControlTest(
+			controlErrorResponse("unknown task bash_9"))
+
+		err := callWithTimeout(t, func(ctx context.Context) error {
+			_, err := stream.GetTaskOutput(ctx, "bash_9")
+			return err
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unknown task")
+	})
+}
+
+func TestStreamReadMcpResource(t *testing.T) {
+	t.Run("request wire shape and parse", func(t *testing.T) {
+		stream, transport, _ := newStreamControlTest(
+			successSDKControlResponseWithPayload(map[string]interface{}{
+				"contents": []interface{}{
+					map[string]interface{}{
+						"uri":      "ui://widgets/chart.html",
+						"mimeType": "text/html;profile=mcp-app",
+						"text":     "<p>chart</p>",
+						"_meta": map[string]interface{}{
+							"ui": map[string]interface{}{
+								"csp": map[string]interface{}{
+									"connectDomains": []interface{}{"api.example.com"},
+								},
+							},
+						},
+					},
+					map[string]interface{}{
+						"uri":  "ui://widgets/logo.png",
+						"blob": "iVBORw0KGgo=",
+					},
+				},
+			}),
+		)
+
+		var got *SDKControlMcpReadResourceResponse
+		err := callWithTimeout(t, func(ctx context.Context) error {
+			var err error
+			got, err = stream.ReadMcpResource(ctx, "widgets", "ui://widgets/chart.html")
+			return err
+		})
+		require.NoError(t, err)
+
+		// serverName is camelCase on the wire, like mcp_reconnect/mcp_toggle.
+		assert.JSONEq(t,
+			`{"type":"control_request","request_id":"req_1","request":{"subtype":"mcp_read_resource","serverName":"widgets","uri":"ui://widgets/chart.html"}}`,
+			rawWrittenSDKControlRequest(t, transport),
+		)
+
+		require.Len(t, got.Contents, 2)
+		assert.Equal(t, "<p>chart</p>", got.Contents[0].Text)
+		assert.Equal(t, "text/html;profile=mcp-app", got.Contents[0].MimeType)
+		assert.Contains(t, got.Contents[0].Meta, "ui")
+		assert.Equal(t, "iVBORw0KGgo=", got.Contents[1].Blob)
+		assert.Empty(t, got.Contents[1].Text)
+	})
+
+	t.Run("error", func(t *testing.T) {
+		stream, _, _ := newStreamControlTest(
+			controlErrorResponse("uri must use the ui:// scheme"))
+
+		err := callWithTimeout(t, func(ctx context.Context) error {
+			_, err := stream.ReadMcpResource(ctx, "widgets", "file:///etc/passwd")
+			return err
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "ui://")
+	})
+}

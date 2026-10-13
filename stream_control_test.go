@@ -111,7 +111,7 @@ func newStreamControlTest(
 	stream := &Stream{
 		client:  client,
 		ctx:     context.Background(),
-		sendCh:  make(chan string),
+		sendCh:  make(chan UserMessage),
 		closeCh: make(chan struct{}),
 	}
 	return stream, transport, protocol
@@ -322,15 +322,17 @@ func TestStreamSetMcpPermissionModeOverrideParsesWarning(t *testing.T) {
 }
 
 func TestStreamSetMaxThinkingTokensRoundTrip(t *testing.T) {
+	// The key is always sent. A nil budget must go out as an explicit null:
+	// since v0.3.290 the CLI reads an absent key as "leave the budget as it
+	// is", so omitting it would silently turn the reset into a no-op.
 	tests := []struct {
-		name        string
-		tokens      *int
-		wantPresent bool
-		want        float64
+		name   string
+		tokens *int
+		want   interface{}
 	}{
-		{name: "nil omitted", tokens: nil},
-		{name: "zero present", tokens: intPtr(0), wantPresent: true, want: 0},
-		{name: "nonzero present", tokens: intPtr(4096), wantPresent: true, want: 4096},
+		{name: "nil sends null", tokens: nil, want: nil},
+		{name: "zero present", tokens: intPtr(0), want: float64(0)},
+		{name: "nonzero present", tokens: intPtr(4096), want: float64(4096)},
 	}
 
 	for _, tt := range tests {
@@ -347,10 +349,6 @@ func TestStreamSetMaxThinkingTokensRoundTrip(t *testing.T) {
 			assert.Equal(t, "set_max_thinking_tokens", body["subtype"])
 
 			got, ok := body["max_thinking_tokens"]
-			if !tt.wantPresent {
-				assert.False(t, ok, "max_thinking_tokens should be omitted")
-				return
-			}
 			require.True(t, ok, "max_thinking_tokens should be present")
 			assert.Equal(t, tt.want, got)
 		})
@@ -394,6 +392,42 @@ func TestStreamSetMaxThinkingTokensThinkingDisplay(t *testing.T) {
 		got, ok := body["thinking_display"]
 		require.True(t, ok, "thinking_display should be present as null")
 		assert.Nil(t, got)
+	})
+}
+
+func TestStreamRenameSession(t *testing.T) {
+	t.Run("title only omits source and session_id", func(t *testing.T) {
+		stream, transport, _ := newStreamControlTest(successSDKControlResponse)
+
+		err := callWithTimeout(t, func(ctx context.Context) error {
+			return stream.RenameSession(ctx, "New title")
+		})
+		require.NoError(t, err)
+
+		_, generic := decodeWrittenSDKControlRequest(t, transport)
+		body := genericRequestBody(t, generic)
+		assert.Equal(t, "rename_session", body["subtype"])
+		assert.Equal(t, "New title", body["title"])
+		assert.NotContains(t, body, "source")
+		assert.NotContains(t, body, "session_id")
+	})
+
+	t.Run("source and session guard carried through", func(t *testing.T) {
+		stream, transport, _ := newStreamControlTest(successSDKControlResponse)
+
+		err := callWithTimeout(t, func(ctx context.Context) error {
+			return stream.RenameSession(ctx, "Guarded title",
+				WithRenameSource(RenameSessionSourceHost),
+				WithRenameSessionID("sess-123"))
+		})
+		require.NoError(t, err)
+
+		_, generic := decodeWrittenSDKControlRequest(t, transport)
+		body := genericRequestBody(t, generic)
+		assert.Equal(t, "rename_session", body["subtype"])
+		assert.Equal(t, "Guarded title", body["title"])
+		assert.Equal(t, "host", body["source"])
+		assert.Equal(t, "sess-123", body["session_id"])
 	})
 }
 
@@ -510,4 +544,55 @@ func TestStreamControlRequestRespectsContextCancel(t *testing.T) {
 
 	_, exists = protocol.pendingReqs.Load(req.RequestID)
 	assert.False(t, exists, "pending request should be cleaned up after cancellation")
+}
+
+// TestStreamSendMessage checks SendMessage writes the caller's fields through
+// untouched and fills in only the envelope defaults it leaves empty.
+func TestStreamSendMessage(t *testing.T) {
+	stream, transport, _ := newStreamControlTest(successSDKControlResponse)
+	stream.sessionID = "sess_send"
+	go stream.handleSends()
+	defer stream.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	require.NoError(t, stream.SendMessage(ctx, UserMessage{
+		UUID: "550e8400-e29b-41d4-a716-446655440900",
+		Message: APIUserMessage{
+			Content: []UserContentBlock{{Type: "text", Text: "explain: boom"}},
+		},
+		PastedContent:  []PastedContentEntry{{Text: "stack trace"}},
+		InlinePastes:   []string{"boom"},
+		ClientComposed: true,
+	}))
+	require.NoError(t, stream.Send(ctx, "plain"))
+
+	var written []Message
+	require.Eventually(t, func() bool {
+		written = transport.writtenMessages()
+		return len(written) == 2
+	}, time.Second, 5*time.Millisecond)
+
+	full := written[0].(UserMessage)
+	assert.Equal(t, "user", full.Type)
+	assert.Equal(t, "sess_send", full.SessionID)
+	assert.Equal(t, "user", full.Message.Role)
+	assert.Equal(t, "550e8400-e29b-41d4-a716-446655440900", full.UUID)
+	assert.Equal(t, []string{"boom"}, full.InlinePastes)
+	assert.Equal(t, "stack trace", full.PastedContent[0].Text)
+	assert.True(t, full.ClientComposed)
+
+	plain := written[1].(UserMessage)
+	assert.Equal(t, "plain", plain.Message.Content[0].Text)
+	assert.False(t, plain.ClientComposed)
+}
+
+func TestStreamSendMessageAfterClose(t *testing.T) {
+	stream, _, _ := newStreamControlTest(successSDKControlResponse)
+	require.NoError(t, stream.Close())
+
+	err := stream.SendMessage(context.Background(), UserMessage{})
+	var closed *ErrTransportClosed
+	assert.ErrorAs(t, err, &closed)
 }

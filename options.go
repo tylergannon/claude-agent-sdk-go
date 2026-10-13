@@ -28,19 +28,22 @@ type Options struct {
 	// flipped flag, or a different append is enough to cause that. A recorded
 	// prompt cannot change until the conversation is compacted.
 	//
-	// The three states are distinct, which is why this is a pointer:
-	//   - nil: only a bare preset is recorded. Setting a custom prompt or an
-	//     append turns recording off, so that text is applied fresh on every
-	//     launch. This is the historical behavior.
-	//   - true: an existing record is sent as-is, and a later launch's
-	//     different prompt or append is ignored until compaction or a new
-	//     session. With no record yet, the prompt is rendered with the append
-	//     included, sent, and recorded for the rest of the conversation.
-	//   - false: never record; render fresh every request.
+	// As of v0.3.270 recording is the default, so the pointer distinguishes
+	// two behaviors, not three:
+	//   - nil or true: the default. The prompt is rendered on the first
+	//     request with the append (or a custom prompt) included, sent, and
+	//     recorded; every later request and resume sends the record as-is —
+	//     even when a later launch passes different text — until compaction.
+	//   - false: never record; render fresh every request. For iterating on
+	//     prompt text, or a host that must change its append within a session.
+	//
+	// Before v0.3.270 an omitted field recorded only a bare preset and left a
+	// custom prompt or append rendering fresh each launch; that is no longer
+	// the default.
 	//
 	// Safe to set before the feature reaches an account: where recording is
 	// not yet enabled, and on Bedrock, Vertex and Foundry today, the field is
-	// accepted and does nothing (sdk.d.ts v0.3.263 L3990).
+	// accepted and does nothing (sdk.d.ts v0.3.270 L4178).
 	SystemPromptSnapshot *bool
 
 	// Model specifies which Claude model to use.
@@ -70,6 +73,25 @@ type Options struct {
 	// AdditionalDirectories are additional directories Claude can access.
 	AdditionalDirectories []string
 
+	// ProjectConfigRoot names the trusted checkout that Cwd is a worktree of,
+	// and is emitted as --project-config-root. Must be an absolute path.
+	//
+	// It moves where the session reads its project configuration from:
+	// project settings (hooks, permissions), .mcp.json, the .claude config
+	// trees (commands, agents, skills, workflows, routines, output-styles)
+	// and CLAUDE_PROJECT_DIR all come from here instead of Cwd. So whatever
+	// the branch checked out in Cwd happens to carry is not what the session
+	// runs.
+	//
+	// That inversion is the point: a worktree of an untrusted branch can be
+	// given a session whose hooks and permission rules come from a checkout
+	// you control. It also means pointing this at a directory you do not
+	// control hands that directory's hooks a session, so treat it as the
+	// security decision it is.
+	//
+	// A routine cannot be activated through it (sdk.d.ts v0.3.278 L1469).
+	ProjectConfigRoot string
+
 	// Env is a map of environment variables to overlay onto the CLI
 	// subprocess environment. Entries are appended to os.Environ()
 	// before spawn, so parent-process variables like PATH and HOME
@@ -86,7 +108,10 @@ type Options struct {
 	Env map[string]string
 
 	// PermissionMode controls tool execution permissions.
-	// Default: PermissionModeDefault
+	// Default: PermissionModeDefault, which keeps manual approvals through
+	// CanUseTool. Set "" to omit --permission-mode and let the CLI pick its
+	// starting mode as it does for claude -p: the settings'
+	// permissions.defaultMode, else auto where auto mode is available.
 	PermissionMode PermissionMode
 
 	// AllowDangerouslySkipPermissions enables bypassing permissions.
@@ -180,6 +205,15 @@ type Options struct {
 	// ForwardSubagentText surfaces subagent text in the main stream.
 	ForwardSubagentText *bool
 
+	// VerbatimPrompts sends every user message with client_composed set, so
+	// the CLI delivers prompt text as written: no @path expansion and no
+	// slash-command dispatch. Use it when prompts are assembled from content
+	// the end user did not type. There is no per-message opt-out while it is
+	// on; for per-turn control leave it off and set
+	// UserMessage.ClientComposed on individual messages. Requires Claude Code
+	// 2.1.248 or later; older CLIs ignore the field (sdk.d.ts v0.3.290 L1893).
+	VerbatimPrompts bool
+
 	// ToolAliases maps a tool name to a redirect target. When the model
 	// emits a `tool_use` whose name is a key in the map, the execution path
 	// resolves the mapped value instead. Single-hop (cycles do not loop).
@@ -213,6 +247,9 @@ type Options struct {
 	ManagedSettings *Settings
 
 	// Sandbox configures sandbox behavior programmatically.
+	//
+	// Not yet sent to the CLI (#301): nothing reads this field. Use
+	// Settings.Sandbox through WithSettings instead.
 	Sandbox *SandboxSettings
 
 	// Betas enables beta features.
@@ -485,6 +522,15 @@ type Settings struct {
 	DisableAllHooks            *bool                            `json:"disableAllHooks,omitempty"`
 	DisableSkillShellExecution *bool                            `json:"disableSkillShellExecution,omitempty"`
 	DefaultShell               string                           `json:"defaultShell,omitempty"`
+	// BashEditDiffEnabled controls whether the Bash tool shows a diff of the
+	// files a Bash command changed; PostToolUse Bash hooks then get the
+	// changed-file list in tool_response. Defaults to on wherever the Bash
+	// tool handles file edits, so a pointer is needed to turn it off — a
+	// plain bool could not express the only setting worth writing.
+	//
+	// Outside auto and bypassPermissions modes only user, flag or policy
+	// settings can turn it on (sdk.d.ts v0.3.270 L6682).
+	BashEditDiffEnabled *bool `json:"bashEditDiffEnabled,omitempty"`
 	// BashOutputMaxChars caps how many characters of a successful Bash or
 	// PowerShell command's output Claude receives inline (default 30000,
 	// clamped to 4000-128000). Output past the cap is written to a file and
@@ -492,29 +538,49 @@ type Settings struct {
 	// replaces BASH_MAX_OUTPUT_LENGTH, which on its own only sizes the
 	// read-back window (sdk.d.ts v0.3.263 L6298).
 	BashOutputMaxChars *int `json:"bashOutputMaxChars,omitempty"`
-	// TaskOutputMaxChars caps how many characters of a background task's
-	// output the TaskOutput tool hands Claude inline (default 32000, same
-	// 4000-128000 clamp). Longer output is cut to its most recent
-	// characters plus the path of the full output file — except for a shell
-	// command still running, which returns its first characters instead.
-	// Setting this also replaces TASK_MAX_OUTPUT_LENGTH (sdk.d.ts v0.3.263
-	// L6302).
+	// TaskOutputMaxChars is deprecated and no longer has any effect: the
+	// TaskOutput tool was removed, so a background task's output is read with
+	// the Read tool instead. The field is kept so existing settings keep
+	// parsing (sdk.d.ts v0.3.278 L6870).
 	TaskOutputMaxChars *int `json:"taskOutputMaxChars,omitempty"`
 	// RespondToBashCommands controls whether Claude responds after an
 	// input-box ! bash command runs. Set to false to add the command output to
 	// context without a response. Default true. Mirrors sdk.d.ts v0.3.195 L5032.
-	RespondToBashCommands           *bool                          `json:"respondToBashCommands,omitempty"`
-	AllowManagedHooksOnly           *bool                          `json:"allowManagedHooksOnly,omitempty"`
-	AllowedHTTPHookURLs             []string                       `json:"allowedHttpHookUrls,omitempty"`
-	HTTPHookAllowedEnvVars          []string                       `json:"httpHookAllowedEnvVars,omitempty"`
-	AllowManagedPermissionRulesOnly *bool                          `json:"allowManagedPermissionRulesOnly,omitempty"`
-	AllowManagedMCPServersOnly      *bool                          `json:"allowManagedMcpServersOnly,omitempty"`
-	StrictPluginOnlyCustomization   interface{}                    `json:"strictPluginOnlyCustomization,omitempty"`
-	StatusLine                      *SettingsCommand               `json:"statusLine,omitempty"`
-	PRURLTemplate                   string                         `json:"prUrlTemplate,omitempty"`
-	SubagentStatusLine              *SettingsCommand               `json:"subagentStatusLine,omitempty"`
-	EnabledPlugins                  map[string]interface{}         `json:"enabledPlugins,omitempty"`
-	ExtraKnownMarketplaces          map[string]SettingsMarketplace `json:"extraKnownMarketplaces,omitempty"`
+	RespondToBashCommands           *bool                  `json:"respondToBashCommands,omitempty"`
+	AllowManagedHooksOnly           *bool                  `json:"allowManagedHooksOnly,omitempty"`
+	AllowedHTTPHookURLs             []string               `json:"allowedHttpHookUrls,omitempty"`
+	HTTPHookAllowedEnvVars          []string               `json:"httpHookAllowedEnvVars,omitempty"`
+	AllowManagedPermissionRulesOnly *bool                  `json:"allowManagedPermissionRulesOnly,omitempty"`
+	AllowManagedMCPServersOnly      *bool                  `json:"allowManagedMcpServersOnly,omitempty"`
+	StrictPluginOnlyCustomization   interface{}            `json:"strictPluginOnlyCustomization,omitempty"`
+	StatusLine                      *SettingsCommand       `json:"statusLine,omitempty"`
+	PRURLTemplate                   string                 `json:"prUrlTemplate,omitempty"`
+	SubagentStatusLine              *SettingsCommand       `json:"subagentStatusLine,omitempty"`
+	EnabledPlugins                  map[string]interface{} `json:"enabledPlugins,omitempty"`
+	// PrependPlugins lists managed plugins — plugin@marketplace ids that
+	// managed EnabledPlugins sets true — whose hooks run first and outermost,
+	// in the order given: the first id sees every event before any other
+	// plugin and every result after it. Managed plugins named in neither this
+	// nor AppendPlugins follow the listed ones, then user, project and
+	// marketplace plugins, then AppendPlugins, then the built-ins.
+	//
+	// The bundled sec-default@builtin seats itself outermost on a machine
+	// with managed settings and for Team and Enterprise organizations —
+	// unless this list is set, in which case list it where it should sit or
+	// leave it out deliberately. Any id that is not an enabled managed plugin
+	// is skipped; an id in both keys is prepended.
+	//
+	// Honored only from managed settings, or from user settings on a machine
+	// with none; ignored in project, local and --settings sources (sdk.d.ts
+	// v0.3.270 L6789).
+	PrependPlugins []string `json:"prependPlugins,omitempty"`
+	// AppendPlugins is the mirror of PrependPlugins: managed plugins whose
+	// hooks run last among plugins, innermost, in the order given. The last
+	// id listed sits just above the built-in plugins and sees each event as
+	// every other plugin left it. Same source restrictions (sdk.d.ts v0.3.270
+	// L6793).
+	AppendPlugins          []string                       `json:"appendPlugins,omitempty"`
+	ExtraKnownMarketplaces map[string]SettingsMarketplace `json:"extraKnownMarketplaces,omitempty"`
 	// StrictKnownMarketplaces and BlockedMarketplaces are the managed-settings
 	// policy lists, and are the only place a github entry may use the
 	// owner-wildcard form {"source":"github","repo":"owner/*"} to match every
@@ -561,15 +627,40 @@ type Settings struct {
 	PluginSuggestionMarketplaces []string `json:"pluginSuggestionMarketplaces,omitempty"`
 	// ForceLoginMethod pins the login flow: "claudeai" for Claude Pro/Max, "console" for Console billing, "gateway" for the Cloud gateway OIDC device flow (the "gateway" variant was added in v0.3.168). Mirrors sdk.d.ts v0.3.168 L5246.
 	ForceLoginMethod string `json:"forceLoginMethod,omitempty"`
-	// ForceLoginGatewayURL is the Cloud gateway URL to pre-fill and
-	// auto-connect to during login, and only means anything alongside
-	// ForceLoginMethod "gateway". Honored only from admin-controlled managed
-	// settings (MDM, managed-settings.json, policy helper) and ignored in
-	// user, project, and remote-delivered settings, since pointing a login
-	// flow at an attacker-chosen gateway is exactly what that tier exists to
-	// prevent. Mirrors sdk.d.ts v0.3.233 L6914.
-	ForceLoginGatewayURL       string                       `json:"forceLoginGatewayUrl,omitempty"`
-	ForceLoginOrgUUID          interface{}                  `json:"forceLoginOrgUUID,omitempty"`
+	// ForceLoginGatewayURL is the Cloud gateway URL to pre-fill during
+	// login, and only means anything alongside ForceLoginMethod "gateway".
+	// Honored from admin-controlled managed settings (MDM,
+	// managed-settings.json, policy helper) and, on a machine with none of
+	// those, from the user's own user settings. Ignored in project, local,
+	// flag (--settings) and remote-delivered settings. Since v0.3.296 it no
+	// longer auto-connects, only pre-fills (sdk.d.ts v0.3.296 L8681).
+	// GatewayInternalNetworks lists the IPv4 CIDR blocks your Cloud gateway
+	// sits in — at most 4, each /8 to /32, non-overlapping: the public block
+	// an organization numbers its internal network from, which is what lets
+	// /login reach a gateway there. A block must lie entirely outside private
+	// space, where /login accepts a gateway without this key at all.
+	//
+	// /login accepts a gateway inside a listed block only over a direct
+	// connection, and only when this machine's own address on that connection
+	// is inside the same block — so login must happen from a machine whose
+	// address is in the block, not through a proxy, VPN pool, container or
+	// NAT segment outside it. That is a bar against a copied settings file,
+	// not proof of location.
+	//
+	// Honored only from admin-controlled managed settings (MDM,
+	// managed-settings.json, policy helper); ignored in user, project and
+	// remote-delivered settings (sdk.d.ts v0.3.270 L7992).
+	GatewayInternalNetworks []string    `json:"gatewayInternalNetworks,omitempty"`
+	ForceLoginGatewayURL    string      `json:"forceLoginGatewayUrl,omitempty"`
+	ForceLoginOrgUUID       interface{} `json:"forceLoginOrgUUID,omitempty"`
+	// AllowedProviders lists the API providers Claude Code may use on this
+	// machine; a session on any other is refused at startup, at login, and
+	// on its next API contact. Nil allows every provider, while an empty
+	// non-nil slice allows none, hence omitzero rather than omitempty. Only
+	// a list in managed-settings.json or MDM is enforcement on the machine;
+	// one set only server-side reaches only sessions that fetch it (sdk.d.ts
+	// v0.3.290 L8610).
+	AllowedProviders           []AllowedProvider            `json:"allowedProviders,omitzero"`
 	ForceRemoteSettingsRefresh *bool                        `json:"forceRemoteSettingsRefresh,omitempty"`
 	OtelHeadersHelper          string                       `json:"otelHeadersHelper,omitempty"`
 	OutputStyle                string                       `json:"outputStyle,omitempty"`
@@ -582,7 +673,12 @@ type Settings struct {
 	SpinnerVerbs               *SettingsSpinnerVerbs        `json:"spinnerVerbs,omitempty"`
 	SpinnerTipsOverride        *SettingsSpinnerTipsOverride `json:"spinnerTipsOverride,omitempty"`
 	SyntaxHighlightingDisabled *bool                        `json:"syntaxHighlightingDisabled,omitempty"`
-	TerminalTitleFromRename    *bool                        `json:"terminalTitleFromRename,omitempty"`
+	// MaxProseWidth caps, in terminal columns, the width of prose in
+	// Claude's responses; tables and code blocks keep the full width, and
+	// only the display wraps. Minimum 40; unset uses the full terminal
+	// width (sdk.d.ts v0.3.290 L8917).
+	MaxProseWidth           *int  `json:"maxProseWidth,omitempty"`
+	TerminalTitleFromRename *bool `json:"terminalTitleFromRename,omitempty"`
 	// PromptCacheTTL is the prompt-cache lifetime for the main conversation —
 	// interactive, -p and SDK turns, plus the helpers running inline with
 	// them. Empty means automatic: one hour on a Claude subscription within
@@ -599,6 +695,19 @@ type Settings struct {
 	SubagentPromptCacheTTL CacheTTL    `json:"subagentPromptCacheTtl,omitempty"`
 	AlwaysThinkingEnabled  *bool       `json:"alwaysThinkingEnabled,omitempty"`
 	EffortLevel            EffortLevel `json:"effortLevel,omitempty"`
+	// MaxEffortLevel caps effort: anything above it — an /effort or /model
+	// pick, --effort, CLAUDE_CODE_EFFORT_LEVEL, a model default — is clamped
+	// down, on every provider including Bedrock, Vertex and Foundry. It
+	// combines with an organization's per-model cap by taking the lower of
+	// the two, and across settings files the lowest value wins.
+	// SettingsModel.MaxEffortLevel replaces it per model.
+	//
+	// Unlike the sibling EffortLevel, "max" IS a member here: listing it is
+	// how you decline to cap.
+	//
+	// Enforced client-side, so an effort supplied through
+	// CLAUDE_CODE_EXTRA_BODY is not clamped (sdk.d.ts v0.3.270 L8329).
+	MaxEffortLevel EffortLevel `json:"maxEffortLevel,omitempty"`
 	// ModelSettings holds per-model settings keyed by canonical model name —
 	// the per-model twin of EffortLevel above. Note the ceiling differs: a
 	// persisted per-model effort tops out at "xhigh", where the init message's
@@ -610,7 +719,10 @@ type Settings struct {
 	// those applies, and it is ignored in .claude/settings.json and
 	// .claude/settings.local.json (sdk.d.ts v0.3.241 L7381).
 	Spellcheck *SettingsSpellcheck `json:"spellcheck,omitempty"`
-	// Ultracode enables session-scoped workflow orchestration, typically via --settings or apply_flag_settings. Mirrors sdk.d.ts v0.3.168 L5413.
+	// Ultracode enables standing dynamic-workflow orchestration for the
+	// session at any effort level (it no longer implies xhigh), typically via
+	// --settings or apply_flag_settings. Requires workflows to be enabled and
+	// a model that supports ultracode (sdk.d.ts v0.3.290 L8987).
 	Ultracode                    *bool  `json:"ultracode,omitempty"`
 	AutoCompactWindow            *int   `json:"autoCompactWindow,omitempty"`
 	AdvisorModel                 string `json:"advisorModel,omitempty"`
@@ -691,6 +803,10 @@ type Settings struct {
 	// background before it is needed. Only applies when auto-compact is on.
 	// Mirrors sdk.d.ts v0.3.220 L6545.
 	PrecomputeCompactionEnabled *bool `json:"precomputeCompactionEnabled,omitempty"`
+	// IdleCompaction set to false stops Claude Code from compacting a long
+	// conversation while the session is idle. True does not turn idle
+	// compaction on (sdk.d.ts v0.3.290 L9235).
+	IdleCompaction *bool `json:"idleCompaction,omitempty"`
 	// SwitchModelsOnFlag switches models automatically when safety measures flag a message. Mirrors sdk.d.ts v0.3.168 L5620.
 	SwitchModelsOnFlag *bool `json:"switchModelsOnFlag,omitempty"`
 	// AutoContinueAtUsageLimit waits for a claude.ai usage limit to reset and
@@ -705,9 +821,10 @@ type Settings struct {
 	TerminalProgressBarEnabled *bool `json:"terminalProgressBarEnabled,omitempty"`
 	TodoFeatureEnabled         *bool `json:"todoFeatureEnabled,omitempty"`
 	// WorkflowSizeGuideline is the advisory size guideline for the dynamic
-	// workflows Claude writes: "small" (<5 agents), "medium" (<15, the
-	// default), "large" (<50), or "unrestricted" (no guideline). A value here
-	// takes precedence over the /config choice. Mirrors sdk.d.ts v0.3.220 L5396.
+	// workflows Claude writes: "small" (<5 agents), "medium" (<10), "large"
+	// (<50), or "unrestricted" (no guideline). Unset defaults to "medium", or
+	// "small" on Pro plans. A value here takes precedence over the /config
+	// choice (sdk.d.ts v0.3.278 L6849; "medium" was <15 before v0.3.278).
 	WorkflowSizeGuideline string `json:"workflowSizeGuideline,omitempty"`
 	// EmojiCompletionEnabled toggles the :emoji: shortcode typeahead (the
 	// suggestion popup and :name: inline replacement). Enabled when absent or
@@ -736,6 +853,12 @@ type Settings struct {
 	WorkflowKeywordTriggerEnabled *bool `json:"workflowKeywordTriggerEnabled,omitempty"`
 	// AllowAllClaudeAiMcps lets claude.ai cloud MCP connectors load alongside managed-mcp.json. Mirrors sdk.d.ts v0.3.150 L4411.
 	AllowAllClaudeAiMcps *bool `json:"allowAllClaudeAiMcps,omitempty"`
+	// AllowClaudeInChromeWithManagedMcp lets the built-in Claude in Chrome
+	// MCP server run alongside managed-mcp.json instead of being blocked by
+	// its exclusive-control lockdown. deniedMcpServers and the
+	// organization's Claude in Chrome setting still block it. Honored only
+	// from device managed settings (sdk.d.ts v0.3.290 L7280).
+	AllowClaudeInChromeWithManagedMcp *bool `json:"allowClaudeInChromeWithManagedMcp,omitempty"`
 	// ManagedMCPServers are MCP servers the organization provides to every
 	// user, keyed by server name, each value carrying the .mcp.json entry
 	// shape. Only "http" and "sse" servers are accepted: nothing that names
@@ -794,6 +917,22 @@ type Settings struct {
 	DefaultView string `json:"defaultView,omitempty"`
 	// EnforceAvailableModels restricts model selection to AvailableModels. Mirrors sdk.d.ts v0.3.177 L4608.
 	EnforceAvailableModels *bool `json:"enforceAvailableModels,omitempty"`
+	// AvailableModelsMatch picks how AvailableModels entries match model
+	// IDs. Prefix (the default) lets an entry also allow any ID extending it,
+	// so "claude-opus-5" allows "claude-opus-5-5"; exact stops a model ID
+	// entry from allowing other versions, and with a non-empty list also
+	// confines the Default option to listed models, refusing to start if
+	// none is usable. Read from managed settings only (sdk.d.ts v0.3.290
+	// L6849).
+	AvailableModelsMatch AvailableModelsMatch `json:"availableModelsMatch,omitempty"`
+	// DeniedModels are models users cannot select even when AvailableModels
+	// allows them. A family alias blocks the family; a model ID blocks that
+	// version in every spelling (dates, -fast and provider prefixes are
+	// ignored), and an ID with no minor version also blocks later minors.
+	// The Default option steps down past a blocked model, and Claude Code
+	// refuses to start when nothing allowed is left. Read from managed
+	// settings only (sdk.d.ts v0.3.290 L6853).
+	DeniedModels []string `json:"deniedModels,omitempty"`
 	// DisableBundledSkills removes the skills and workflows that ship with Claude Code: bundled skills/workflows are removed entirely and built-in slash commands stay typable but hidden from the model. Plugins, .claude/skills/, and .claude/commands/ are unaffected. Equivalent to CLAUDE_CODE_DISABLE_BUNDLED_SKILLS=1. Mirrors sdk.d.ts v0.3.177 L4636.
 	DisableBundledSkills *bool `json:"disableBundledSkills,omitempty"`
 	// DisableArtifact disables the artifact view. Mirrors sdk.d.ts v0.3.177 L4905.
@@ -847,6 +986,13 @@ type SettingsPolicyHelper struct {
 	RefreshIntervalMs *int   `json:"refreshIntervalMs,omitempty"`
 }
 
+// SettingsAttribution customizes the attribution Claude Code adds to commits
+// and PRs.
+//
+// On the wire attribution is a boolean | object union (sdk.d.ts v0.3.290
+// L6773): the object customizes each piece, while a bare false hides all
+// attribution. HideAll selects the bare false; a bare true means the same as
+// leaving attribution out and decodes as the zero value.
 type SettingsAttribution struct {
 	Commit *string `json:"commit,omitempty"`
 	PR     *string `json:"pr,omitempty"`
@@ -855,6 +1001,36 @@ type SettingsAttribution struct {
 	// true). Set false to omit the Claude-Session trailer and PR-body link.
 	// Mirrors sdk.d.ts v0.3.185 L4551.
 	SessionURL *bool `json:"sessionUrl,omitempty"`
+	// HideAll encodes attribution as a bare false, hiding all attribution;
+	// the other fields are then ignored. Claude Code versions before the
+	// boolean form reject it, so for settings shared with older CLIs set
+	// Commit and PR to "" and SessionURL to false instead.
+	HideAll bool `json:"-"`
+}
+
+// MarshalJSON emits a bare false for HideAll, else the object form.
+func (a SettingsAttribution) MarshalJSON() ([]byte, error) {
+	if a.HideAll {
+		return []byte("false"), nil
+	}
+	type plain SettingsAttribution
+	return json.Marshal(plain(a))
+}
+
+// UnmarshalJSON accepts the boolean or the object form.
+func (a *SettingsAttribution) UnmarshalJSON(data []byte) error {
+	var b bool
+	if err := json.Unmarshal(data, &b); err == nil {
+		*a = SettingsAttribution{HideAll: !b}
+		return nil
+	}
+	type plain SettingsAttribution
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	*a = SettingsAttribution(p)
+	return nil
 }
 
 type SettingsPermissions struct {
@@ -920,6 +1096,14 @@ type SettingsMCPServerMatcher struct {
 	ServerURL     string   `json:"serverUrl,omitempty"`
 }
 
+// SettingsHookOnFailure is the SettingsHook.OnFailure policy.
+type SettingsHookOnFailure string
+
+const (
+	SettingsHookOnFailureContinue SettingsHookOnFailure = "continue"
+	SettingsHookOnFailureBlock    SettingsHookOnFailure = "block"
+)
+
 type SettingsHookMatcher struct {
 	Matcher string         `json:"matcher,omitempty"`
 	Hooks   []SettingsHook `json:"hooks"`
@@ -949,13 +1133,22 @@ type SettingsHook struct {
 	// continue=true lets the turn proceed depends on the event's decision:"block"
 	// semantics: on PostToolUse, the reason is fed back to Claude and the turn
 	// continues.
-	ContinueOnBlock *bool             `json:"continueOnBlock,omitempty"`
-	StatusMessage   string            `json:"statusMessage,omitempty"`
-	Once            *bool             `json:"once,omitempty"`
-	Async           *bool             `json:"async,omitempty"`
-	AsyncRewake     *bool             `json:"asyncRewake,omitempty"`
-	Headers         map[string]string `json:"headers,omitempty"`
-	AllowedEnvVars  []string          `json:"allowedEnvVars,omitempty"`
+	ContinueOnBlock *bool `json:"continueOnBlock,omitempty"`
+	// OnFailure decides what a failure of a command or http hook does: it
+	// could not start, timed out, exited with a code other than 0 or 2, or
+	// printed JSON that is invalid or fails validation. The default,
+	// SettingsHookOnFailureContinue, reports the failure and lets the action
+	// go ahead; SettingsHookOnFailureBlock treats it as exit code 2 and
+	// blocks the tool call, permission request or prompt the event guards.
+	// Ignored for async hooks and on Stop, SubagentStop, TaskCompleted and
+	// TeammateIdle (sdk.d.ts v0.3.296 L7101).
+	OnFailure      SettingsHookOnFailure `json:"onFailure,omitempty"`
+	StatusMessage  string                `json:"statusMessage,omitempty"`
+	Once           *bool                 `json:"once,omitempty"`
+	Async          *bool                 `json:"async,omitempty"`
+	AsyncRewake    *bool                 `json:"asyncRewake,omitempty"`
+	Headers        map[string]string     `json:"headers,omitempty"`
+	AllowedEnvVars []string              `json:"allowedEnvVars,omitempty"`
 }
 
 func (h SettingsHook) MarshalJSON() ([]byte, error) {
@@ -1023,7 +1216,91 @@ type SettingsModel struct {
 	// EffortLevel is the persisted effort level for this model. Unlike the
 	// init message's applied effort, "max" is not a member here.
 	EffortLevel EffortLevel `json:"effortLevel,omitempty"`
+	// MaxEffortLevel caps effort for this model. Within one settings file it
+	// replaces the top-level Settings.MaxEffortLevel for the model, and "max"
+	// is how you exempt a model from that cap; across settings files the
+	// lowest applicable value wins.
+	//
+	// Keyed like EffortLevel: the canonical model name also matches its
+	// dated, [1m], Bedrock and Vertex spellings (sdk.d.ts v0.3.270 L8342).
+	MaxEffortLevel EffortLevel `json:"maxEffortLevel,omitempty"`
+	// AutoCompactWindow is this model's auto-compact window. Within one
+	// settings file it replaces the top-level Settings.AutoCompactWindow for
+	// the model; /autocompact saves here (sdk.d.ts v0.3.290 L8980).
+	AutoCompactWindow *AutoCompactWindow `json:"autoCompactWindow,omitempty"`
 }
+
+// AutoCompactWindow is the per-model auto-compact window union: a token count
+// (100000 to 1000000), or "auto" for the window tuned for the model. Auto
+// takes precedence when both are set.
+type AutoCompactWindow struct {
+	Auto   bool
+	Tokens int
+}
+
+// MarshalJSON emits "auto" or the token count.
+func (w AutoCompactWindow) MarshalJSON() ([]byte, error) {
+	if w.Auto {
+		return json.Marshal("auto")
+	}
+	return json.Marshal(w.Tokens)
+}
+
+// UnmarshalJSON accepts either wire form of the union.
+func (w *AutoCompactWindow) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		// A string other than "auto" from a newer CLI decodes as unset
+		// rather than failing the whole settings document around it.
+		*w = AutoCompactWindow{Auto: s == "auto"}
+		return nil
+	}
+	var tokens int
+	if err := json.Unmarshal(data, &tokens); err != nil {
+		return err
+	}
+	*w = AutoCompactWindow{Tokens: tokens}
+	return nil
+}
+
+// AvailableModelsMatch is how Settings.AvailableModels entries match model
+// IDs.
+type AvailableModelsMatch string
+
+const (
+	// AvailableModelsMatchPrefix lets an entry allow any model ID extending
+	// it. The default.
+	AvailableModelsMatchPrefix AvailableModelsMatch = "prefix"
+	// AvailableModelsMatchExact stops a model ID entry from allowing other
+	// versions; family aliases still allow the whole family.
+	AvailableModelsMatchExact AvailableModelsMatch = "exact"
+)
+
+// AllowedProvider is one entry of Settings.AllowedProviders.
+type AllowedProvider string
+
+const (
+	// AllowedProviderAnthropic is the Anthropic API on Anthropic's own host,
+	// via a claude.ai or Console sign-in or an API key.
+	AllowedProviderAnthropic AllowedProvider = "anthropic"
+	// AllowedProviderCustomEndpoint is the Anthropic API or a cloud
+	// provider's API sent to some other host, such as an LLM gateway;
+	// admitted only for the base URL pinned in the same managed source's env
+	// block.
+	AllowedProviderCustomEndpoint AllowedProvider = "customEndpoint"
+	// AllowedProviderBedrock is Amazon Bedrock.
+	AllowedProviderBedrock AllowedProvider = "bedrock"
+	// AllowedProviderVertex is Google Vertex AI.
+	AllowedProviderVertex AllowedProvider = "vertex"
+	// AllowedProviderFoundry is Microsoft Foundry.
+	AllowedProviderFoundry AllowedProvider = "foundry"
+	// AllowedProviderAnthropicAws is the anthropicAws provider.
+	AllowedProviderAnthropicAws AllowedProvider = "anthropicAws"
+	// AllowedProviderMantle is the mantle provider.
+	AllowedProviderMantle AllowedProvider = "mantle"
+	// AllowedProviderGateway is the Cloud gateway sign-in.
+	AllowedProviderGateway AllowedProvider = "gateway"
+)
 
 // SettingsModelPicker curates the rows shown in the /model picker.
 type SettingsModelPicker struct {
@@ -1064,7 +1341,8 @@ type SettingsModelPickerOption struct {
 // SettingsModelPricing prices usage at an organization's contracted rates.
 type SettingsModelPricing struct {
 	// Multiplier scales every computed cost, overridden or not — 0.85 charges
-	// 85% of the price. Must fall in (0, 1].
+	// 85% of the price, 1.2 charges 120%. Must fall in (0, 10] (widened from
+	// (0, 1] in sdk.d.ts v0.3.278 L6518).
 	Multiplier *float64 `json:"multiplier,omitempty"`
 
 	// Overrides maps a model ID to its rates. A key Claude Code itself uses
@@ -1131,8 +1409,24 @@ type SettingsMarketplace struct {
 
 // SettingsMarketplaceSource is the opaque marketplace source descriptor. Required key "source"
 // selects the variant; remaining keys depend on the variant (e.g. "repo", "url", "package",
-// "path", "ref", "sparsePaths", "skipLfs"). Per sdk.d.ts v0.3.168 L4695/L4717 (github) and
-// L4895/L4917 (git), the optional "skipLfs": boolean key sets GIT_LFS_SKIP_SMUDGE=1 on clone/update.
+// "path", "ref", "sparsePaths", "skipLfs").
+//
+// The npm source ("source": "npm") takes an optional "version" (a dist-tag or
+// range, defaulting to the latest dist-tag) and "registry". "registry" is
+// dual-purpose: on an add it is a one-off registry override (otherwise the npm
+// configuration decides); in a strictKnownMarketplaces / blockedMarketplaces
+// policy entry it is the origin and path prefix the package's resolved tarball
+// URL must fall under. The npm "package" key also governs plugins installed
+// straight from the npm marketplace (<package>@npm) — an exact name matches
+// that package, and "@scope/*" matches every package under the scope
+// (sdk.d.ts v0.3.278 L7546).
+//
+// The optional "skipLfs": boolean key on the git and github sources is now a
+// documented no-op, accepted only so existing settings keep parsing: Claude
+// Code's own git never smudges Git LFS content, so LFS-tracked files check out
+// as pointers regardless. To fetch their content, run git lfs pull in the
+// marketplace's checkout under ~/.claude/plugins/marketplaces/ (sdk.d.ts
+// v0.3.278 L7522).
 //
 // Sources that carry an inline "catalog" array accept two per-entry keys
 // scoped to downloading that entry's "archive" source: "headers"
@@ -1155,12 +1449,13 @@ type SettingsMarketplaceSourceKind string
 
 const (
 	// SettingsMarketplaceSourceGithub identifies a GitHub marketplace source. Mirrors sdk.d.ts v0.3.150 L4459.
-	// Honors optional "skipLfs": boolean per sdk.d.ts v0.3.168 L4695.
+	// Accepts optional "skipLfs": boolean, a documented no-op as of v0.3.278 (see SettingsMarketplaceSource).
 	SettingsMarketplaceSourceGithub SettingsMarketplaceSourceKind = "github"
 	// SettingsMarketplaceSourceGit identifies a Git marketplace source. Mirrors sdk.d.ts v0.3.150 L4466.
-	// Honors optional "skipLfs": boolean per sdk.d.ts v0.3.168 L4717.
+	// Accepts optional "skipLfs": boolean, a documented no-op as of v0.3.278 (see SettingsMarketplaceSource).
 	SettingsMarketplaceSourceGit SettingsMarketplaceSourceKind = "git"
 	// SettingsMarketplaceSourceNPM identifies an npm marketplace source. Mirrors sdk.d.ts v0.3.150 L4484.
+	// Accepts optional "version" and "registry" keys as of v0.3.278 (see SettingsMarketplaceSource).
 	SettingsMarketplaceSourceNPM SettingsMarketplaceSourceKind = "npm"
 	// SettingsMarketplaceSourceFile identifies a file marketplace source. Mirrors sdk.d.ts v0.3.150 L4500.
 	SettingsMarketplaceSourceFile SettingsMarketplaceSourceKind = "file"
@@ -1659,7 +1954,10 @@ type ToolsConfig struct {
 //
 // Type is one of "adaptive", "enabled", or "disabled". BudgetTokens applies only
 // when Type is "enabled"; if nil, the CLI is told to use adaptive thinking. Display
-// applies when Type is "adaptive" or "enabled" and is one of "summarized" or "omitted".
+// applies when Type is "adaptive" or "enabled" and is one of "summarized" or
+// "omitted". ThinkingDisplayHighlights is NOT accepted here: the spawn-time
+// --thinking-display flag takes only the first two (sdk.d.ts v0.3.278 L9204).
+// See ThinkingDisplayHighlights.
 type ThinkingConfig struct {
 	Type         string          `json:"type"`
 	BudgetTokens *int            `json:"budgetTokens,omitempty"`
@@ -1674,6 +1972,23 @@ const (
 	ThinkingDisplaySummarized ThinkingDisplay = "summarized"
 	// ThinkingDisplayOmitted suppresses thinking blocks entirely.
 	ThinkingDisplayOmitted ThinkingDisplay = "omitted"
+	// ThinkingDisplayHighlights returns one short title per stretch of
+	// thinking, the API's thinking highlights, instead of a prose summary.
+	//
+	// It is accepted only mid-session, via Stream.SetMaxThinkingTokens with
+	// WithThinkingDisplay. The spawn-time --thinking-display flag does not
+	// take it, so setting it in ThinkingConfig hands the CLI a value it will
+	// reject (sdk.d.ts v0.3.278 L2746 and L4779 for the accepted union,
+	// L9204 for the spawn-time one that still excludes it).
+	//
+	// Even mid-session it is conditional: the API honors highlights only for
+	// Claude Code sessions Anthropic hosts. Anywhere else the control request
+	// still SUCCEEDS and the session then falls back to
+	// ThinkingDisplayOmitted once the API has rejected the value. So a host
+	// that asks for highlights and sees no thinking text is looking at that
+	// fallback, not at a bug, and there is no success/failure signal on the
+	// response to distinguish the two.
+	ThinkingDisplayHighlights ThinkingDisplay = "highlights"
 )
 
 // ThinkingAdaptive lets Claude decide when and how much to think.
@@ -1796,6 +2111,13 @@ func WithAgentProgressSummaries(enable bool) Option {
 func WithForwardSubagentText(enable bool) Option {
 	return func(o *Options) {
 		o.ForwardSubagentText = &enable
+	}
+}
+
+// WithVerbatimPrompts enables or disables Options.VerbatimPrompts.
+func WithVerbatimPrompts(enable bool) Option {
+	return func(o *Options) {
+		o.VerbatimPrompts = enable
 	}
 }
 
@@ -2219,6 +2541,66 @@ type MatchedAskRule struct {
 	RuleContent string `json:"rule_content,omitempty"`
 }
 
+// MCPServerProvenance identifies the MCP server serving an mcp__* tool and
+// where that server's definition came from (sdk.d.ts v0.3.278 L1154).
+//
+// Key trust decisions on Source, never on Name and never on the tool-name
+// prefix. MCPServerSourceSDK is the only value meaning an in-process server
+// this SDK host registered, and the CLI will not report it for a server that
+// merely shares the name of one — so a configured server cannot impersonate a
+// host-registered one by naming itself after it.
+//
+// Name is the server's configuration key: for MCPServerSourceSDK, exactly the
+// name registered via Options.MCPServers; for every other source, the key as
+// authored in that configuration. That makes it untrusted, producer-authored
+// text — escape it before display.
+//
+// Absent for non-MCP tools and on CLIs that predate the field.
+type MCPServerProvenance struct {
+	Name   string          `json:"name"`
+	Source MCPServerSource `json:"source"`
+}
+
+// MCPServerSource names where an MCP server's definition came from.
+//
+// This is an open set: the CLI may report a source this SDK does not know.
+// Compare against the constants below and treat an unrecognized value as some
+// other configured source — never as MCPServerSourceSDK.
+type MCPServerSource string
+
+const (
+	// MCPServerSourceSDK is an in-process server the SDK host registered.
+	// Only the host can register one.
+	MCPServerSourceSDK MCPServerSource = "sdk"
+	// MCPServerSourcePlugin is a server a plugin ships or registers at runtime.
+	MCPServerSourcePlugin MCPServerSource = "plugin"
+	// MCPServerSourceUser is a server from user-scope configuration.
+	MCPServerSourceUser MCPServerSource = "user"
+	// MCPServerSourceProject is a server from project-scope configuration.
+	MCPServerSourceProject MCPServerSource = "project"
+	// MCPServerSourceLocal is a server from local-scope configuration.
+	MCPServerSourceLocal MCPServerSource = "local"
+	// MCPServerSourceDynamic is a process server supplied via --mcp-config or
+	// the mcp_set_servers control request.
+	MCPServerSourceDynamic MCPServerSource = "dynamic"
+	// MCPServerSourceManaged is a server from managed settings.
+	MCPServerSourceManaged MCPServerSource = "managed"
+	// MCPServerSourceEnterprise is a server from enterprise configuration.
+	MCPServerSourceEnterprise MCPServerSource = "enterprise"
+	// MCPServerSourceClaudeAI is a server configured on claude.ai.
+	MCPServerSourceClaudeAI MCPServerSource = "claudeai"
+	// MCPServerSourceAgent is a server declared by an agent definition.
+	MCPServerSourceAgent MCPServerSource = "agent"
+)
+
+// IsSDK reports whether the server is an in-process one this SDK host
+// registered. Prefer it over comparing Source by hand: it is the single
+// trust-relevant question this type answers, and it keeps an unknown source
+// from being mistaken for a host-registered server.
+func (p *MCPServerProvenance) IsSDK() bool {
+	return p != nil && p.Source == MCPServerSourceSDK
+}
+
 // PermissionContext provides additional context for permission decisions.
 type PermissionContext struct {
 	SessionID string
@@ -2248,7 +2630,13 @@ type PermissionContext struct {
 	// while the ask still carries the tool's own decision reason. Nil when no
 	// such rule applied. See MatchedAskRule (sdk.d.ts v0.3.215).
 	MatchedAskRule *MatchedAskRule
-	Metadata       map[string]interface{}
+	// MCPServer identifies the MCP server behind an mcp__* tool and where its
+	// definition came from. Nil for non-MCP tools and on CLIs that predate the
+	// field, so a host that auto-approves on provenance must treat nil as
+	// "unknown" rather than as a host-registered server (sdk.d.ts v0.3.278
+	// L241).
+	MCPServer *MCPServerProvenance
+	Metadata  map[string]interface{}
 }
 
 // PermissionDecisionClassification labels how a permission decision was reached
@@ -2497,6 +2885,12 @@ type PreToolUseInput struct {
 	BaseHookInput
 	ToolName  string          `json:"tool_name"`
 	ToolInput json.RawMessage `json:"tool_input"`
+	// MCPServer identifies the MCP server behind an mcp__* tool and where its
+	// definition came from. Nil for non-MCP tools and on CLIs that predate the
+	// field; neither case licenses a hook to assume SDK provenance. Key any
+	// policy on MCPServerProvenance.IsSDK, never on the tool-name prefix
+	// (sdk.d.ts v0.3.278 L2644).
+	MCPServer *MCPServerProvenance `json:"mcp_server,omitempty"`
 }
 
 // HookType implements HookInput.
@@ -2511,6 +2905,12 @@ type PostToolUseInput struct {
 	ToolName     string          `json:"tool_name"`
 	ToolInput    json.RawMessage `json:"tool_input"`
 	ToolResponse json.RawMessage `json:"tool_response"`
+	// MCPServer identifies the MCP server behind an mcp__* tool and where its
+	// definition came from. Nil for non-MCP tools and on CLIs that predate the
+	// field; neither case licenses a hook to assume SDK provenance. Key any
+	// policy on MCPServerProvenance.IsSDK, never on the tool-name prefix
+	// (sdk.d.ts v0.3.278 L2566).
+	MCPServer *MCPServerProvenance `json:"mcp_server,omitempty"`
 }
 
 // HookType implements HookInput.
@@ -2794,6 +3194,12 @@ type PostToolUseFailureInput struct {
 	ToolInput   json.RawMessage `json:"tool_input"`
 	Error       string          `json:"error"`
 	IsInterrupt bool            `json:"is_interrupt,omitempty"`
+	// MCPServer identifies the MCP server behind an mcp__* tool and where its
+	// definition came from. Nil for non-MCP tools and on CLIs that predate the
+	// field; neither case licenses a hook to assume SDK provenance. Key any
+	// policy on MCPServerProvenance.IsSDK, never on the tool-name prefix
+	// (sdk.d.ts v0.3.278 L2548).
+	MCPServer *MCPServerProvenance `json:"mcp_server,omitempty"`
 }
 
 // HookType implements HookInput.
@@ -2891,6 +3297,12 @@ type PermissionRequestInput struct {
 	ToolName              string             `json:"tool_name"`
 	ToolInput             json.RawMessage    `json:"tool_input"`
 	PermissionSuggestions []PermissionUpdate `json:"permission_suggestions,omitempty"`
+	// MCPServer identifies the MCP server behind an mcp__* tool and where its
+	// definition came from. Nil for non-MCP tools and on CLIs that predate the
+	// field; neither case licenses a hook to assume SDK provenance. Key any
+	// policy on MCPServerProvenance.IsSDK, never on the tool-name prefix
+	// (sdk.d.ts v0.3.278 L2390).
+	MCPServer *MCPServerProvenance `json:"mcp_server,omitempty"`
 }
 
 // HookType implements HookInput.
@@ -2906,6 +3318,12 @@ type PermissionDeniedInput struct {
 	ToolInput json.RawMessage `json:"tool_input"`
 	ToolUseID string          `json:"tool_use_id"`
 	Reason    string          `json:"reason"`
+	// MCPServer identifies the MCP server behind an mcp__* tool and where its
+	// definition came from. Nil for non-MCP tools and on CLIs that predate the
+	// field; neither case licenses a hook to assume SDK provenance. Key any
+	// policy on MCPServerProvenance.IsSDK, never on the tool-name prefix
+	// (sdk.d.ts v0.3.278 L2372).
+	MCPServer *MCPServerProvenance `json:"mcp_server,omitempty"`
 }
 
 // HookType implements HookInput.
@@ -3011,15 +3429,46 @@ const (
 	AssistantMessageErrorOAuthOrgNotAllowed   AssistantMessageError = "oauth_org_not_allowed"
 	// AssistantMessageErrorAccountOnHold marks a turn refused because the
 	// account is on hold (sdk.d.ts v0.3.241 L159).
-	AssistantMessageErrorAccountOnHold   AssistantMessageError = "account_on_hold"
-	AssistantMessageErrorBillingError    AssistantMessageError = "billing_error"
-	AssistantMessageErrorRateLimit       AssistantMessageError = "rate_limit"
-	AssistantMessageErrorOverloaded      AssistantMessageError = "overloaded"
-	AssistantMessageErrorInvalidRequest  AssistantMessageError = "invalid_request"
-	AssistantMessageErrorModelNotFound   AssistantMessageError = "model_not_found"
-	AssistantMessageErrorServerError     AssistantMessageError = "server_error"
-	AssistantMessageErrorUnknown         AssistantMessageError = "unknown"
-	AssistantMessageErrorMaxOutputTokens AssistantMessageError = "max_output_tokens"
+	AssistantMessageErrorAccountOnHold AssistantMessageError = "account_on_hold"
+	// AssistantMessageErrorVerificationRequired marks a turn refused because
+	// the account still has verification outstanding (sdk.d.ts v0.3.270
+	// L3411).
+	AssistantMessageErrorVerificationRequired AssistantMessageError = "verification_required"
+	AssistantMessageErrorBillingError         AssistantMessageError = "billing_error"
+	AssistantMessageErrorRateLimit            AssistantMessageError = "rate_limit"
+	AssistantMessageErrorOverloaded           AssistantMessageError = "overloaded"
+	AssistantMessageErrorInvalidRequest       AssistantMessageError = "invalid_request"
+	AssistantMessageErrorModelNotFound        AssistantMessageError = "model_not_found"
+	AssistantMessageErrorServerError          AssistantMessageError = "server_error"
+	AssistantMessageErrorUnknown              AssistantMessageError = "unknown"
+	AssistantMessageErrorMaxOutputTokens      AssistantMessageError = "max_output_tokens"
+	// AssistantMessageErrorCloudCredentialError marks a turn that failed
+	// because the cloud provider credential could not be used (sdk.d.ts
+	// v0.3.270 L3411).
+	AssistantMessageErrorCloudCredentialError AssistantMessageError = "cloud_credential_error" //nolint:gosec // G101: wire enum value, not a credential
+)
+
+// Known values for the resume_reason field carried on AssistantMessage,
+// PartialAssistantMessage and ResultMessage, naming why the turn was the
+// automatic re-run of a turn a worker restart interrupted
+// (CLAUDE_CODE_RESUME_INTERRUPTED_TURN).
+//
+// The field stays a plain string: the CLI forwards the host's
+// CLAUDE_CODE_RESUME_REASON verbatim when one is set, so the set is open and a
+// host is free to mint its own. Compare against these instead of literals, but
+// do not assume they are exhaustive (sdk.d.ts v0.3.270 L3362).
+const (
+	// ResumeReasonInterruptedTurn is the fallback the CLI supplies when the
+	// host set no CLAUDE_CODE_RESUME_REASON of its own.
+	ResumeReasonInterruptedTurn = "interrupted_turn"
+	// ResumeReasonHostDraining means the host was draining the worker.
+	ResumeReasonHostDraining = "host_draining"
+	// ResumeReasonCheckpointRestore means the worker was restored from a
+	// checkpoint.
+	ResumeReasonCheckpointRestore = "checkpoint_restore"
+	// ResumeReasonContainerRecreated means the worker's container was
+	// recreated underneath the session.
+	ResumeReasonContainerRecreated = "container_recreated"
 )
 
 // Known values for the apiKeySource field on SystemMessage and AccountInfo,
@@ -3430,10 +3879,21 @@ type AgentDefinition struct {
 	Skills                             []string             `json:"skills,omitempty"`
 	InitialPrompt                      string               `json:"initialPrompt,omitempty"`
 	MaxTurns                           int                  `json:"maxTurns,omitempty"`
-	Background                         *bool                `json:"background,omitempty"`
-	Memory                             AgentMemoryScope     `json:"memory,omitempty"`
-	Effort                             AgentEffort          `json:"effort,omitempty"`
-	PermissionMode                     PermissionMode       `json:"permissionMode,omitempty"`
+	// AutoCompactWindow is the token count at which this agent compacts its
+	// own conversation when it runs as a subagent. It only lowers the window
+	// the subagent would otherwise inherit; zero leaves it unset. No effect
+	// on the main session agent (sdk.d.ts v0.3.296 L79).
+	AutoCompactWindow int   `json:"autoCompactWindow,omitempty"`
+	Background        *bool `json:"background,omitempty"`
+	// OmitClaudeMd runs this agent without the user, project and local
+	// CLAUDE.md instruction files when it runs as a subagent; managed policy
+	// files are kept. For agents that take everything they need from the
+	// delegation prompt. No effect on the main session agent (sdk.d.ts
+	// v0.3.278 L81).
+	OmitClaudeMd   bool             `json:"omitClaudeMd,omitempty"`
+	Memory         AgentMemoryScope `json:"memory,omitempty"`
+	Effort         AgentEffort      `json:"effort,omitempty"`
+	PermissionMode PermissionMode   `json:"permissionMode,omitempty"`
 	// Observer names an agent type auto-spawned as a background observer
 	// whenever this agent runs. The observer receives read-only activity
 	// digests and reports via the ObserverReport tool; it never
@@ -3458,7 +3918,9 @@ func (a AgentDefinition) MarshalJSON() ([]byte, error) {
 		Skills                             []string             `json:"skills,omitempty"`
 		InitialPrompt                      string               `json:"initialPrompt,omitempty"`
 		MaxTurns                           int                  `json:"maxTurns,omitempty"`
+		AutoCompactWindow                  int                  `json:"autoCompactWindow,omitempty"`
 		Background                         *bool                `json:"background,omitempty"`
+		OmitClaudeMd                       bool                 `json:"omitClaudeMd,omitempty"`
 		Memory                             AgentMemoryScope     `json:"memory,omitempty"`
 		Effort                             *AgentEffort         `json:"effort,omitempty"`
 		PermissionMode                     PermissionMode       `json:"permissionMode,omitempty"`
@@ -3477,7 +3939,9 @@ func (a AgentDefinition) MarshalJSON() ([]byte, error) {
 		Skills:                             a.Skills,
 		InitialPrompt:                      a.InitialPrompt,
 		MaxTurns:                           a.MaxTurns,
+		AutoCompactWindow:                  a.AutoCompactWindow,
 		Background:                         a.Background,
+		OmitClaudeMd:                       a.OmitClaudeMd,
 		Memory:                             a.Memory,
 		PermissionMode:                     a.PermissionMode,
 		Observer:                           a.Observer,
@@ -3643,12 +4107,14 @@ type MCPServerConfig struct {
 	// or the default.
 	Timeout *int `json:"timeout,omitempty"`
 	// AlwaysLoad, when true, forces every tool from this server to be included
-	// in the prompt instead of deferred behind tool search. Equivalent to
-	// setting defer_loading: false on the API. Default: tools are deferred
-	// when tool search is enabled. Side effect: setting this blocks startup
-	// until the server is connected (capped at the standard 5s connect
-	// timeout), even though MCP startup is otherwise non-blocking; the tools
-	// must be present when the turn-1 prompt is built.
+	// in the prompt instead of deferred behind tool search, except a tool the
+	// server itself lists with _meta anthropic/alwaysLoad set to false.
+	// Equivalent to setting defer_loading: false on the API. When false, all
+	// of the server's tools are deferred behind tool search. Default: tools
+	// are deferred when tool search is enabled. Side effect: true blocks
+	// startup until the server is connected (capped at the standard 5s
+	// connect timeout), even though MCP startup is otherwise non-blocking;
+	// the tools must be present when the turn-1 prompt is built.
 	AlwaysLoad *bool `json:"alwaysLoad,omitempty"`
 }
 
@@ -3729,10 +4195,11 @@ func WithSystemPromptPreset(preset string, append string) Option {
 }
 
 // WithSystemPromptSnapshot records the conversation's system prompt once and
-// reuses it verbatim on every later request and resume. Recommended: true.
+// reuses it verbatim on every later request and resume.
 //
-// Omitting this is not the same as passing false — see
-// Options.SystemPromptSnapshot for the three states.
+// As of v0.3.270 recording is the default, so passing true matches the
+// omitted behavior; pass false to opt out and render fresh every request. See
+// Options.SystemPromptSnapshot.
 func WithSystemPromptSnapshot(snapshot bool) Option {
 	return func(o *Options) {
 		o.SystemPromptSnapshot = &snapshot
@@ -3752,6 +4219,17 @@ func WithFallbackModel(model string) Option {
 func WithCwd(cwd string) Option {
 	return func(o *Options) {
 		o.Cwd = cwd
+	}
+}
+
+// WithProjectConfigRoot names the trusted checkout that the session's cwd is
+// a worktree of, so project settings, .mcp.json, the .claude config trees and
+// CLAUDE_PROJECT_DIR are read from there instead of the cwd. Must be an
+// absolute path. See Options.ProjectConfigRoot for what that moves, and why
+// it is a security decision rather than a convenience.
+func WithProjectConfigRoot(dir string) Option {
+	return func(o *Options) {
+		o.ProjectConfigRoot = dir
 	}
 }
 
@@ -3802,6 +4280,9 @@ func WithManagedSettings(settings Settings) Option {
 }
 
 // WithSandbox configures sandbox behavior programmatically.
+//
+// Not yet sent to the CLI (#301), so it currently enables nothing. Use
+// WithSettings with Settings.Sandbox instead.
 func WithSandbox(sandbox *SandboxSettings) Option {
 	return func(o *Options) {
 		o.Sandbox = sandbox

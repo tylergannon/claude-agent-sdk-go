@@ -528,7 +528,7 @@ func (c *Client) Stream(ctx context.Context) (*Stream, error) {
 		client:    c,
 		ctx:       ctx,
 		sessionID: c.options.SessionOptions.SessionID,
-		sendCh:    make(chan string, 4),
+		sendCh:    make(chan UserMessage, 4),
 		closeCh:   make(chan struct{}),
 	}, nil
 }
@@ -661,7 +661,7 @@ type Stream struct {
 	client    *Client
 	ctx       context.Context
 	sessionID string
-	sendCh    chan string
+	sendCh    chan UserMessage
 	closeCh   chan struct{}
 	closeOnce sync.Once
 }
@@ -671,12 +671,27 @@ type Stream struct {
 // Messages are queued and sent asynchronously. The response will appear
 // in the Messages() iterator.
 func (s *Stream) Send(ctx context.Context, prompt string) error {
+	return s.SendMessage(ctx, UserMessage{
+		Message: APIUserMessage{
+			Content: []UserContentBlock{{Type: "text", Text: prompt}},
+		},
+	})
+}
+
+// SendMessage submits a fully formed user message to the stream, the Go
+// analog of handing an SDKUserMessage to the TS SDK's streamInput. Use it
+// for the fields Send can't express: PastedContent, InlinePastes, a
+// per-message ClientComposed, a client UUID, or a Priority.
+//
+// Type, SessionID and Message.Role are filled in when left empty. Like Send,
+// the message is queued and written asynchronously.
+func (s *Stream) SendMessage(ctx context.Context, msg UserMessage) error {
 	select {
 	case <-s.closeCh:
 		return &ErrTransportClosed{}
 	case <-ctx.Done():
 		return ctx.Err()
-	case s.sendCh <- prompt:
+	case s.sendCh <- msg:
 		return nil
 	}
 }
@@ -732,17 +747,15 @@ func (s *Stream) handleSends() {
 			return
 		case <-s.ctx.Done():
 			return
-		case prompt := <-s.sendCh:
-			userMsg := UserMessage{
-				Type:      "user",
-				SessionID: s.sessionID,
-				Message: APIUserMessage{
-					Role: "user",
-					Content: []UserContentBlock{
-						{Type: "text", Text: prompt},
-					},
-				},
-				ParentToolUseID: nil,
+		case userMsg := <-s.sendCh:
+			if userMsg.Type == "" {
+				userMsg.Type = "user"
+			}
+			if userMsg.SessionID == "" {
+				userMsg.SessionID = s.sessionID
+			}
+			if userMsg.Message.Role == "" {
+				userMsg.Message.Role = "user"
 			}
 
 			if err := s.client.protocol.SendMessage(s.ctx, userMsg); err != nil {
@@ -852,6 +865,69 @@ func (s *Stream) SetModel(ctx context.Context, model string) error {
 	return err
 }
 
+// RenameSessionSource says who chose a session title.
+type RenameSessionSource string
+
+const (
+	// RenameSessionSourceRemote is a rename made on claude.ai and relayed to
+	// this process. It is the CLI's default when the field is omitted.
+	RenameSessionSourceRemote RenameSessionSource = "remote"
+	// RenameSessionSourceHost is a rename the user made in the hosting
+	// application, such as an IDE. The CLI counts it as a user rename, which
+	// is what an SDK host driving a title field wants.
+	RenameSessionSourceHost RenameSessionSource = "host"
+)
+
+// RenameSessionOption configures Stream.RenameSession.
+type RenameSessionOption func(*renameSessionOptions)
+
+type renameSessionOptions struct {
+	source    RenameSessionSource
+	sessionID string
+}
+
+// WithRenameSource sets who chose the title. Omitting it leaves the field off
+// the wire, and the CLI then treats the rename as RenameSessionSourceRemote.
+func WithRenameSource(source RenameSessionSource) RenameSessionOption {
+	return func(o *renameSessionOptions) {
+		o.source = source
+	}
+}
+
+// WithRenameSessionID guards the rename against a session switch. Pass the
+// session the title is meant for: if this process has since moved to another
+// one, through /clear or an in-session resume, the CLI refuses the request
+// rather than naming the new session.
+//
+// Worth using whenever the title was composed against a session the caller
+// observed earlier, since the alternative failure is silent and lands a
+// user-visible title on the wrong conversation.
+func WithRenameSessionID(sessionID string) RenameSessionOption {
+	return func(o *renameSessionOptions) {
+		o.sessionID = sessionID
+	}
+}
+
+// RenameSession sets the user-facing title for the current session.
+//
+// Only available in streaming input mode.
+func (s *Stream) RenameSession(
+	ctx context.Context, title string, opts ...RenameSessionOption,
+) error {
+	var cfg renameSessionOptions
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	_, err := s.sendSDKControlRequest(ctx, SDKControlRequestBody{
+		Subtype:         "rename_session",
+		Title:           title,
+		SettingsSource:  string(cfg.source),
+		RenameSessionID: cfg.sessionID,
+	})
+	return err
+}
+
 // McpPermissionOverrideMode is a per-MCP-server permission-mode override. The
 // override is tighten-only: it applies only when the session mode would
 // already auto-allow (bypassPermissions/auto), so it can never widen
@@ -937,6 +1013,16 @@ type SetMaxThinkingTokensOption func(*setMaxThinkingTokensOptions)
 
 // WithThinkingDisplay sets the thinking display mode for the rest of the
 // session. The supplied value replaces the current session display mode.
+//
+// This is the only path that accepts ThinkingDisplayHighlights; the
+// spawn-time ThinkingConfig.Display does not. Note that highlights is honored
+// by the API only for Anthropic-hosted Claude Code sessions. Where the session
+// cannot send it (Bedrock, Vertex and other providers without first-party
+// betas, experimental betas switched off, a Claude 3 model, or after the API
+// has already rejected it once) the request returns an error naming the cause
+// and the display stays as it was; the token budget still applies. Older
+// CLIs instead accepted the request and quietly fell back to
+// ThinkingDisplayOmitted.
 func WithThinkingDisplay(mode ThinkingDisplay) SetMaxThinkingTokensOption {
 	return func(o *setMaxThinkingTokensOptions) {
 		o.display = &ThinkingDisplayOverride{Mode: &mode}
@@ -954,7 +1040,8 @@ func WithThinkingDisplayAPIDefault() SetMaxThinkingTokensOption {
 }
 
 // SetMaxThinkingTokens dynamically changes the max thinking tokens limit.
-// Pass nil tokens to remove the limit.
+// Pass nil tokens to reset thinking to the session default: any mid-session
+// override is cleared, back to the spawn-time budget if one was set.
 //
 // An optional WithThinkingDisplay / WithThinkingDisplayAPIDefault controls the
 // thinking display mode for the rest of the session; when no display option is
@@ -970,7 +1057,7 @@ func (s *Stream) SetMaxThinkingTokens(ctx context.Context, tokens *int, opts ...
 	}
 	_, err := s.sendSDKControlRequest(ctx, SDKControlRequestBody{
 		Subtype:           "set_max_thinking_tokens",
-		MaxThinkingTokens: tokens,
+		MaxThinkingTokens: &MaxThinkingTokensValue{Tokens: tokens},
 		ThinkingDisplay:   cfg.display,
 	})
 	return err
@@ -1124,12 +1211,36 @@ func (s *Stream) ReadFile(
 	return &out, nil
 }
 
-// ReloadPlugins reloads plugins from disk and returns refreshed session metadata.
+// ReloadPluginsOptions configures Stream.ReloadPlugins.
+type ReloadPluginsOptions struct {
+	// HoldOnCacheImpact asks the CLI to run the same check the interactive
+	// /reload-plugins makes before it asks for --force: if applying the
+	// reload would change the session's tool list while the conversation's
+	// prompt cache depends on that list, nothing is applied.
+	//
+	// The response then carries Held == true and a CacheImpact describing
+	// what applying would change, and the session keeps its current plugins.
+	// Call again without the option to apply anyway.
+	HoldOnCacheImpact bool
+}
+
+// ReloadPlugins reloads plugins from disk and returns refreshed session
+// metadata.
+//
+// By default the reload applies unconditionally, which can invalidate the
+// conversation's prompt cache when it changes the tool list. Pass
+// ReloadPluginsOptions{HoldOnCacheImpact: true} to have the CLI check first
+// and report back instead of applying; see SDKControlReloadPluginsResponse.Held.
 func (s *Stream) ReloadPlugins(
-	ctx context.Context,
+	ctx context.Context, opts ...ReloadPluginsOptions,
 ) (*SDKControlReloadPluginsResponse, error) {
+	var o ReloadPluginsOptions
+	if len(opts) > 0 {
+		o = opts[0]
+	}
 	resp, err := s.sendSDKControlRequest(ctx, SDKControlRequestBody{
-		Subtype: "reload_plugins",
+		Subtype:           "reload_plugins",
+		HoldOnCacheImpact: o.HoldOnCacheImpact,
 	})
 	if err != nil {
 		return nil, err
@@ -1207,6 +1318,14 @@ func (s *Stream) ReloadOutputStyles(
 // the CLI treats as a clear-this-key signal. Passing nil as the whole settings
 // map sends an empty object (no-op for all keys).
 //
+// Four keys clear to a session reset rather than to a lower-precedence value:
+// "effortLevel" goes to the model's default effort, "model" to Claude Code's
+// default model (not ANTHROPIC_MODEL or settings.model), "agent" to no
+// main-thread agent, and "ultracode" to off with the current effort kept.
+// "effortLevel" also accepts "max", which is session-only (never written to a
+// settings file): it runs as "high" on a model without max support and no
+// higher than the organization's effort limit for the model.
+//
 // Only available in streaming input mode.
 func (s *Stream) ApplyFlagSettings(
 	ctx context.Context,
@@ -1222,22 +1341,38 @@ func (s *Stream) ApplyFlagSettings(
 	return err
 }
 
-// SettingsSource names the settings file Stream.UpdateSettings writes to. It
-// is a single-member type today; a named type keeps widening it additive.
+// SettingsSource names the settings file Stream.UpdateSettings writes to.
 type SettingsSource string
 
-// SettingsSourceLocal is the project's local settings file — the only scope the
-// CLI accepts today, chosen so a host UI's writes land exactly where /config's
-// do.
-const SettingsSourceLocal SettingsSource = "localSettings"
+const (
+	// SettingsSourceLocal is the project's local settings file, where
+	// /config's own writes land. Its allowlist is outputStyle.
+	SettingsSourceLocal SettingsSource = "localSettings"
+	// SettingsSourceUser is the user's settings file. Its allowlist is
+	// effortLevel, and the write is scoped to the session's current model
+	// (sdk.d.ts v0.3.278 L4820).
+	//
+	// Writing it saves a default the way /effort does, under modelSettings
+	// for whichever model the session is on. It does NOT change the running
+	// session's effort level — that is ApplyFlagSettings. A host that wants
+	// both has to send both.
+	SettingsSourceUser SettingsSource = "userSettings"
+)
 
 // UpdateSettings writes settings to a settings file on disk, the durable
 // counterpart to ApplyFlagSettings' in-memory flag layer. The CLI persists the
-// merge to the named file rather than holding it for the session.
+// merge to the named file rather than holding it for the session, through its
+// own writer: canonical store root, gitignore upkeep, hardened write, the same
+// path /config uses.
 //
-// The CLI enforces a narrow contract: only outputStyle is writable today, its
-// value must be a string, and deletion is unsupported (a key cannot be cleared
-// this way). It refuses remote transports and any session whose
+// The allowlist is per file, not shared, because each file feeds hook and
+// permission-rule loading and so every writable key is a security decision:
+//
+//   - SettingsSourceLocal accepts outputStyle.
+//   - SettingsSourceUser accepts effortLevel.
+//
+// Values must be strings and deletion is unsupported, so a key cannot be
+// cleared this way. The CLI refuses remote transports and any session whose
 // --setting-sources excludes source. Violations surface as an error response.
 //
 // Only available in streaming input mode.
@@ -1254,6 +1389,97 @@ func (s *Stream) UpdateSettings(
 		Settings:       &settings,
 	})
 	return err
+}
+
+// ListPermissionRules returns the session's live permission rules and
+// workspace directories — the same data /permissions lists in the terminal:
+// rules from settings files plus session-only approvals, slash-command grants
+// and --allowedTools flag rules, each with its source.
+//
+// Read-only; this never changes a rule. The rule strings come back verbatim
+// and may carry invisible or control characters by design, so escape them
+// before display (see PermissionRuleEntry.Rule).
+//
+// Only available in streaming input mode.
+func (s *Stream) ListPermissionRules(
+	ctx context.Context,
+) (*SDKControlPermissionRulesState, error) {
+	resp, err := s.sendSDKControlRequest(ctx, SDKControlRequestBody{
+		Subtype: "list_permission_rules",
+	})
+	if err != nil {
+		return nil, err
+	}
+	bytes, err := json.Marshal(resp.Response.Response)
+	if err != nil {
+		return nil, fmt.Errorf("list_permission_rules: marshal: %w", err)
+	}
+	var out SDKControlListPermissionRulesResponse
+	if err := json.Unmarshal(bytes, &out); err != nil {
+		return nil, fmt.Errorf("list_permission_rules: unmarshal: %w", err)
+	}
+	return &out.State, nil
+}
+
+// GetHooksListing returns the read-only snapshot the CLI's /hooks menu renders:
+// settings-file, session and plugin hooks grouped by event and matcher, with
+// display-ready strings and the policy and safe-mode state the menu banners on.
+//
+// Every display string comes back with control characters revealed, not
+// escaped for a host's own surface — escape again before rendering. It is a
+// snapshot at request time; re-request when a hooks surface reopens.
+//
+// Only available in streaming input mode.
+func (s *Stream) GetHooksListing(
+	ctx context.Context,
+) (*SDKControlGetHooksListingResponse, error) {
+	resp, err := s.sendSDKControlRequest(ctx, SDKControlRequestBody{
+		Subtype: "get_hooks_listing",
+	})
+	if err != nil {
+		return nil, err
+	}
+	bytes, err := json.Marshal(resp.Response.Response)
+	if err != nil {
+		return nil, fmt.Errorf("get_hooks_listing: marshal: %w", err)
+	}
+	var out SDKControlGetHooksListingResponse
+	if err := json.Unmarshal(bytes, &out); err != nil {
+		return nil, fmt.Errorf("get_hooks_listing: unmarshal: %w", err)
+	}
+	return &out, nil
+}
+
+// GetTaskOutput reads the end of one background shell or Monitor task's
+// output: at most the last 8 KiB the command wrote, the same tail the
+// terminal's /tasks view shows. It's read-only and starts no model turn, so a
+// host can poll it while the task runs and read it once more after it ends.
+//
+// The output is whatever the command printed, escape sequences included;
+// render it as plain text. The CLI refuses a taskID that is not a shell or
+// Monitor task of this session, and lanes that redact what they persist
+// (Remote Control bridge and tenant workers) refuse the request outright.
+//
+// Only available in streaming input mode.
+func (s *Stream) GetTaskOutput(
+	ctx context.Context, taskID string,
+) (*SDKControlGetTaskOutputResponse, error) {
+	resp, err := s.sendSDKControlRequest(ctx, SDKControlRequestBody{
+		Subtype: "get_task_output",
+		TaskID:  taskID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	bytes, err := json.Marshal(resp.Response.Response)
+	if err != nil {
+		return nil, fmt.Errorf("get_task_output: marshal: %w", err)
+	}
+	var out SDKControlGetTaskOutputResponse
+	if err := json.Unmarshal(bytes, &out); err != nil {
+		return nil, fmt.Errorf("get_task_output: unmarshal: %w", err)
+	}
+	return &out, nil
 }
 
 // StopTask asks the CLI to stop a running task.
@@ -1558,6 +1784,40 @@ func (s *Stream) ReconnectMcpServer(ctx context.Context, serverName string) erro
 		MCPServerName: serverName,
 	})
 	return err
+}
+
+// ReadMcpResource reads one MCP Apps (SEP-1865) UI resource from a connected
+// MCP server the CLI itself dialed, so the host can render a tool's widget.
+// uri must use the ui:// scheme, typically McpServerStatusTool.UIResourceURI.
+// It's read-only and starts no model turn.
+//
+// The contents are untrusted third-party HTML: render them sandboxed. The CLI
+// refuses in-process SDK servers (the host can read those itself), servers
+// that policy blocks, are disabled or unapproved, and servers that are not
+// connected (send ReconnectMcpServer first). Requires a CLI that advertises
+// mcp_read_resource_v1 in the init capabilities.
+//
+// Only available in streaming input mode.
+func (s *Stream) ReadMcpResource(
+	ctx context.Context, serverName, uri string,
+) (*SDKControlMcpReadResourceResponse, error) {
+	resp, err := s.sendSDKControlRequest(ctx, SDKControlRequestBody{
+		Subtype:       "mcp_read_resource",
+		MCPServerName: serverName,
+		URI:           uri,
+	})
+	if err != nil {
+		return nil, err
+	}
+	bytes, err := json.Marshal(resp.Response.Response)
+	if err != nil {
+		return nil, fmt.Errorf("mcp_read_resource: marshal: %w", err)
+	}
+	var out SDKControlMcpReadResourceResponse
+	if err := json.Unmarshal(bytes, &out); err != nil {
+		return nil, fmt.Errorf("mcp_read_resource: unmarshal: %w", err)
+	}
+	return &out, nil
 }
 
 // ToggleMcpServer enables or disables the named MCP server.
